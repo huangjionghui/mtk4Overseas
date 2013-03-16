@@ -1,0 +1,35 @@
+TARGETNAME=FLYExBox
+FILE_VIEW_ROOT_FOLDER= \
+    FLYExBox.def \
+
+FILE_VIEW_RESOURCE_FOLDER= \
+
+FILE_VIEW_INCLUDES_FOLDER= \
+    FLYExBox.h \
+
+SOURCES= \
+   FLYExBox.cpp \
+
+
+RELEASETYPE=PLATFORM
+TARGETTYPE=DYNLINK
+CDEFINES=$(CDEFINES) -DFLYKEY_EXPORTS
+
+CDEFINES=$(CDEFINES) -DFLYAUDIO_RELEASE
+
+INCLUDES= \
+    $(INCLUDES);$(_TARGETPLATROOT)\SRC\arm2\inc;\
+	$(_TARGETPLATROOT)\SRC\inc\flyinc;\
+	
+TARGETLIBS= \
+    $(_PROJECTROOT)\cesysgen\sdk\lib\$(_CPUINDPATH)\coredll.lib \
+    $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyhwlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flyshmlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flysocketlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flyuserlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flyseriallib.lib \
+	$(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\winsock.lib \
+	$(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\ws2.lib \
+
+SOURCELIBS= \
+  $(_PLATCOMMONLIB)\$(_CPUDEPPATH)\auxadc_mt3360_v1.lib \

@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FLYGlobal
+
+EXPORTS FGB_Init
+	FGB_Deinit
+	FGB_Open
+	FGB_Close
+	FGB_Read
+	FGB_Write
+	FGB_Seek
+	FGB_PowerDown
+	FGB_PowerUp
+	FGB_IOControl

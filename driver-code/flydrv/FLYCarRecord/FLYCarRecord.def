@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FLYCarRecord
+
+EXPORTS FCR_Init
+	FCR_Deinit
+	FCR_Open
+	FCR_Close
+	FCR_Read
+	FCR_Write
+	FCR_Seek
+	FCR_PowerDown
+	FCR_PowerUp
+	FCR_IOControl

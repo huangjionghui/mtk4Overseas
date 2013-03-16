@@ -1,0 +1,33 @@
+TARGETNAME=FLY6624RADIO
+FILE_VIEW_ROOT_FOLDER= \
+    FLY6624RADIO.def \
+
+FILE_VIEW_RESOURCE_FOLDER= \
+
+FILE_VIEW_INCLUDES_FOLDER= \
+    FLY6624Radio.h \
+
+SOURCES= \
+    FLY6624Radio.cpp \
+    FLY6624RDS.cpp \
+
+RELEASETYPE=PLATFORM
+TARGETTYPE=DYNLINK
+CDEFINES=$(CDEFINES) -DFLY6624RADIO_EXPORTS
+
+INCLUDES= \
+    $(INCLUDES);$(_TARGETPLATROOT)\SRC\arm2\inc;\
+	$(_TARGETPLATROOT)\SRC\inc\flyinc;\
+	
+TARGETLIBS= \
+  $(_COMMONSDKROOT)\lib\$(_CPUINDPATH)\coredll.lib \
+  $(_COMMONOAKROOT)\lib\$(_CPUINDPATH)\ceddk.lib \
+  $(_PLATCOMMONLIB)\$(_CPUINDPATH)\os_adaption_layer.lib\
+  $(_PLATCOMMONLIB)\$(_CPUINDPATH)\gpio_mt3360_mtk_v1.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyhwlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyshmlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flysocketlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyuserlib.lib \
+  $(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\winsock.lib \
+  $(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\ws2.lib \
+

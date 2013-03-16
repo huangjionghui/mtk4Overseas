@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FLYAssistDisplay
+
+EXPORTS FAD_Init
+	FAD_Deinit
+	FAD_Open
+	FAD_Close
+	FAD_Read
+	FAD_Write
+	FAD_Seek
+	FAD_PowerDown
+	FAD_PowerUp
+	FAD_IOControl

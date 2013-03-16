@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FLYSystem
+
+EXPORTS FSY_Init
+	FSY_Deinit
+	FSY_Open
+	FSY_Close
+	FSY_Read
+	FSY_Write
+	FSY_Seek
+	FSY_PowerDown
+	FSY_PowerUp
+	FSY_IOControl

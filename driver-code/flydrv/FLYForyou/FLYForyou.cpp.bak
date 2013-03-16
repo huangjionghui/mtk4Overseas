@@ -1,0 +1,3133 @@
+// -----------------------------------------------------------------------------
+// File Name    : FLYForyou.cpp
+// Title        : ForyouDVD Driver
+// Author       : JQilin - Copyright (C) 2011
+// Created      : 2011-02-25  
+// Version      : 0.01
+// Target MCU   : WinCE Driver
+// -----------------------------------------------------------------------------
+// Version History:
+/*
+>>>2011-03-03: V0.02 添加文件列表功能
+>>>2011-02-25: V0.01 first draft
+*/
+// FLYForyou.cpp : Defines the entry point for the DLL application.
+//
+
+#include <drvlib.h>
+#include <bspregmap.h>
+#include <oemintr.h>
+#include <oemdrvlib.h>
+#include <pegdser.h>
+#include "driver_global.h"
+#include "FLYForyou.h"
+
+#include "SOC_FuncDef.h"
+#include "SOC_Service.h"
+PUDD_API_TABLE	  pUDDApiTable=NULL;
+
+//软件编译日期
+#define DIGIT(s, no) ((s)[no] - '0')
+
+const int hours = (10 * DIGIT(__TIME__, 0) + DIGIT(__TIME__, 1));
+const int minutes = (10 * DIGIT(__TIME__, 3) + DIGIT(__TIME__, 4));
+const int seconds = (10 * DIGIT(__TIME__, 6) + DIGIT(__TIME__, 7));
+/* WARNING: This will fail in year 10000 and beyond, as it assumes
+* that a year has four digits. */
+const int year = ( 1000 * DIGIT(__DATE__, 7)
+				  + 100 * DIGIT(__DATE__, 8)
+				  + 10 * DIGIT(__DATE__, 9)
+				  + DIGIT(__DATE__, 10));
+
+/*
+* Jan - 1
+* Feb - 2
+* Mar - 3
+* Apr - 4
+* May - 5
+* Jun - 6
+* Jul - 7
+* Aug - 8
+* Sep - 9
+* Oct - 10
+* Nov - 11
+* Dec - 12
+*/
+
+/* Use the last letter as primary "key" and middle letter whenever
+* two months end in the same letter. */
+const int months = (__DATE__[2] == 'b' ? 2 :
+					(__DATE__[2] == 'y' ? 5 :
+					(__DATE__[2] == 'l' ? 7 :
+					(__DATE__[2] == 'g' ? 8 :
+					(__DATE__[2] == 'p' ? 9 :
+					(__DATE__[2] == 't' ? 10 :
+					(__DATE__[2] == 'v' ? 11 :
+					(__DATE__[2] == 'c' ? 12 :
+					(__DATE__[2] == 'n' ?
+					(__DATE__[1] == 'a' ? 1 : 6) :
+					/* Implicit "r" */
+					(__DATE__[1] == 'a' ? 3 : 4))))))))));
+const int day = ( 10 * (__DATE__[4] == ' ' ? 0 : DIGIT(__DATE__, 4))
+				 + DIGIT(__DATE__, 5));
+//软件编译日期
+
+void ForyouDVD_Enable(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bEnable);
+VOID
+FCD_PowerUp(DWORD hDeviceContext);
+VOID
+FCD_PowerDown(DWORD hDeviceContext);
+
+static void procDVDStop(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bForceSend);
+
+void eventInterSetEvent(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = TRUE;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = GetTickCount();
+	LeaveCriticalSection(&pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	SetEvent(pForyouDVDInfo->hHandleGlobalGlobalEvent);
+}
+
+static void eventInterClrEvent(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = FALSE;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = 0;
+	LeaveCriticalSection(&pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+}
+
+static BOOL eventInterWhatEventOn(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	if (pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat])
+	{
+		LeaveCriticalSection(&pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+		return TRUE;
+	}
+	LeaveCriticalSection(&pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	return FALSE;
+}
+
+#define CONTROL_IO_DVDRESET_G	3
+#define CONTROL_IO_DVDRESET_I	5
+
+void DVD_Reset_On(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	SOC_IO_Output(CONTROL_IO_DVDRESET_G,CONTROL_IO_DVDRESET_I,0);
+	pForyouDVDInfo->bAutoResetControlOn = FALSE;
+	pForyouDVDInfo->iAutoResetControlTime = GetTickCount();
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD Reset On")));)
+}
+
+void DVD_Reset_Off(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	SOC_IO_Output(CONTROL_IO_DVDRESET_G,CONTROL_IO_DVDRESET_I,1);
+	pForyouDVDInfo->bAutoResetControlOn = TRUE;
+	pForyouDVDInfo->iAutoResetControlTime = GetTickCount();
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD Reset Off")));)
+}
+
+void DVD_LEDControl_On(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	SOC_IO_Output(CONTROL_IO_LED_G,CONTROL_IO_LED_I,EJECT_LED_ON);
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD LEDControl On")));)
+}
+
+void DVD_LEDControl_Off(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	SOC_IO_Output(CONTROL_IO_LED_G,CONTROL_IO_LED_I,EJECT_LED_OFF);
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD LEDControl Off")));)
+}
+
+static VOID FlyAudioReturnToUser(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *buf,UINT len);
+
+void listFileFolderClearAll(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bFile)
+{
+	if (bFile)
+	{
+		if (pForyouDVDInfo->sForyouDVDInfo.pFileTreeList)
+		{
+			delete []pForyouDVDInfo->sForyouDVDInfo.pFileTreeList;
+			pForyouDVDInfo->sForyouDVDInfo.pFileTreeList = NULL;
+		}
+	} 
+	else
+	{
+		if (pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList)
+		{
+			delete []pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList;
+			pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList = NULL;
+		}
+	}
+}
+
+void listFileFolderNewAll(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bFile,UINT iCount)
+{
+	UINT i;
+	if (bFile)
+	{
+		listFileFolderClearAll(pForyouDVDInfo,TRUE);
+		pForyouDVDInfo->sForyouDVDInfo.pFileTreeList = new FOLDER_FILE_TREE_LIST[iCount];
+		for (i = 0;i < iCount;i++)
+		{
+			pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[i].bStorage = FALSE;
+		}
+	}
+	else
+	{
+		listFileFolderClearAll(pForyouDVDInfo,FALSE);
+		pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList = new FOLDER_FILE_TREE_LIST[iCount];
+		for (i = 0;i < iCount;i++)
+		{
+			pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[i].bStorage = FALSE;
+		}
+	}
+}
+
+void listFileFolderStorageOne(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bFile,UINT iCount,UINT parentIndex,UINT extension,BYTE *name,UINT nameLength)
+{
+	UINT i;
+	BYTE temp8;
+	BYTE sWideChar[512];
+	UINT iWideCharLength;
+	if (bFile)
+	{
+		if (iCount < pForyouDVDInfo->sForyouDVDInfo.pFileCount)
+		{
+			pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].bStorage = TRUE;
+			pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].bFolder = FALSE;
+			pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].parentFolderIndex = parentIndex;
+			pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].extension = extension;
+
+			if (nameLength < 256-1)
+			{
+				if (!pForyouDVDInfo->bFlyaudioDVD)//华阳碟机要交换一下
+				{
+					memcpy(pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name,name,nameLength);
+					for (i = 0; i < nameLength; i += 2)
+					{
+						temp8 = pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[i];
+						pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[i] = pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[i+1];
+						pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[i+1] = temp8;
+					}
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[nameLength] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[nameLength+1] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].nameLength = nameLength + 2;
+				}
+				else
+				{
+					memcpy(pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name,name,nameLength);
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[nameLength] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[nameLength+1] = 0;
+					//RETAILMSG(1,(TEXT("\r\nFileGB2312:")));
+					//for (i = 0;i < nameLength+2;i++)
+					//{
+					//	RETAILMSG(1,(TEXT(" %x"),pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[i]));
+					//}
+
+					//ASCII或者GB2312 To Unicode
+					//iWideCharLength = MultiByteToWideChar (CHINA_CODE_PAGE, 0, (char*)(pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name), -1, NULL, 0);
+					//RETAILMSG(1,(TEXT("\r\niWideCharLength:%d!"),iWideCharLength));
+					//memset(sWideChar,0,512);
+					//MultiByteToWideChar (CHINA_CODE_PAGE, 0, (char*)(pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name), -1, (WCHAR*)sWideChar, iWideCharLength);
+					
+					iWideCharLength
+						= MultiByteToWideChar (CHINA_CODE_PAGE, 0, 
+						(char*)(pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name), nameLength, (WCHAR*)sWideChar, 512);
+					
+					//RETAILMSG(1,(TEXT("\r\nUnicode:")));
+					//for (i = 0;i < iWideCharLength;i++)
+					//{
+					//	RETAILMSG(1,(TEXT(" %x"),sWideChar[i]));
+					//}
+					memcpy(pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name,sWideChar,iWideCharLength*2);
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[iWideCharLength*2] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[iWideCharLength*2+1] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].nameLength = iWideCharLength*2 + 2;
+				}
+			} 
+			else
+			{
+				pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].nameLength = 0;
+			}
+		}
+	} 
+	else
+	{
+		if (iCount < pForyouDVDInfo->sForyouDVDInfo.pFolderCount)
+		{
+			pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].bStorage = TRUE;
+			pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].bFolder = TRUE;
+			pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].parentFolderIndex = parentIndex;
+			pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].extension = 0xFF;
+
+			if (nameLength < 256-1)
+			{
+				if (!pForyouDVDInfo->bFlyaudioDVD)//华阳碟机要交换一下
+				{
+					memcpy(pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name,name,nameLength);
+					for (i = 0; i < nameLength; i += 2)
+					{
+						temp8 = pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[i];
+						pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[i] = pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[i+1];
+						pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[i+1] = temp8;
+					}
+					pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[nameLength] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[nameLength+1] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].nameLength = nameLength + 2;
+				}
+				else
+				{
+					memcpy(pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name,name,nameLength);
+					pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[nameLength] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[nameLength+1] = 0;
+					//RETAILMSG(1,(TEXT("\r\nFileGB2312:")));
+					//for (i = 0;i < nameLength+2;i++)
+					//{
+					//	RETAILMSG(1,(TEXT(" %x"),pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[i]));
+					//}
+					
+					//ASCII或者GB2312 To Unicode
+					//iWideCharLength = MultiByteToWideChar (CHINA_CODE_PAGE, 0, (char*)(pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name), -1, NULL, 0);
+					//RETAILMSG(1,(TEXT("\r\nRadioCurText nTextLen:%d!\r\n"),iWideCharLength));
+					//memset(sWideChar,0,512);
+					//MultiByteToWideChar (CHINA_CODE_PAGE, 0, (char*)(pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name), -1, (WCHAR*)sWideChar, iWideCharLength);
+
+					iWideCharLength
+						= MultiByteToWideChar (CHINA_CODE_PAGE, 0, 
+						(char*)(pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name), nameLength, (WCHAR*)sWideChar, 512);
+
+					//RETAILMSG(1,(TEXT("\r\nUnicode:")));
+					//for (i = 0;i < iWideCharLength*2;i++)
+					//{
+					//	RETAILMSG(1,(TEXT(" %x"),sWideChar[i]));
+					//}
+					memcpy(pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name,sWideChar,iWideCharLength*2);
+					pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[iWideCharLength*2] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].name[iWideCharLength*2+1] = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].nameLength = iWideCharLength*2 + 2;
+				}
+			}
+			else
+			{
+				pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[iCount].nameLength = 0;
+			}
+		}
+	}
+}
+
+UINT getListFolderFileSelectParentIndex(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT index)
+{
+	UINT returnIndex = 0;
+
+	if (0 == index)
+	{
+	}
+	else
+	{
+		if (index < pForyouDVDInfo->sForyouDVDInfo.pFolderCount)
+		{
+			if (pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[index].bStorage)
+			{
+				returnIndex = pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[index].parentFolderIndex;
+			}
+		}
+	}
+	return returnIndex;
+}
+
+UINT getSelectParentFolderFileCount(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT parentIndex,BOOL bFolder)//返回同目录下文件或文件夹数量
+{
+	UINT i;
+	UINT iCount = 0;
+	if (bFolder)
+	{
+		for (i = 0;i < pForyouDVDInfo->sForyouDVDInfo.pFolderCount;i++)
+		{
+			if (pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[i].parentFolderIndex == parentIndex)
+			{
+				iCount++;
+			}
+		} 
+	}
+	else
+	{
+		for (i = 0;i < pForyouDVDInfo->sForyouDVDInfo.pFileCount;i++)
+		{
+			if (pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[i].parentFolderIndex == parentIndex)
+			{
+				iCount++;
+			}
+		} 
+	}
+	return iCount;
+}
+
+UINT getSelectParentFolderFileInfoBySubIndex(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT parentIndex,BOOL bFolder,UINT subIndex)//根据目录和子序号，返回全局序号
+{
+	UINT i;
+	UINT iCount = 0;
+	if (bFolder)
+	{
+		for (i = 0;i < pForyouDVDInfo->sForyouDVDInfo.pFolderCount;i++)
+		{
+			if (pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[i].parentFolderIndex == parentIndex)
+			{
+				if (iCount == subIndex)
+				{
+					return i;
+				}
+				iCount++;
+			}
+		} 
+	}
+	else
+	{
+		for (i = 0;i < pForyouDVDInfo->sForyouDVDInfo.pFileCount;i++)
+		{
+			if (pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[i].parentFolderIndex == parentIndex)
+			{
+				if (iCount == subIndex)
+				{
+					return i;
+				}
+				iCount++;
+			}
+		} 
+	}
+	return -1;
+}
+
+UINT getSelectFolderFileIndexByGlobalIndexInParent(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bFolder,UINT globalIndex)//根据全局序号，返回同目录下的子序号,此处特殊和协议的上一级目录序号有关
+{
+	UINT i;
+	UINT iParent;
+	UINT iFolderCount = 0;
+	UINT iFileCount = 0;
+	if (bFolder)
+	{
+		iParent = pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[globalIndex].parentFolderIndex;
+		for (i = 0;i < pForyouDVDInfo->sForyouDVDInfo.pFolderCount;i++)
+		{
+			if (i == globalIndex)
+			{
+				if (iParent)
+				{
+					return iFolderCount + 1;
+				}
+				else
+				{
+					return iFolderCount;
+				}
+			}
+			if (iParent == pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[i].parentFolderIndex)
+			{
+				iFolderCount++;
+			}
+		}
+	}
+	else
+	{
+		iParent = pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[globalIndex].parentFolderIndex;
+		iFolderCount = getSelectParentFolderFileCount(pForyouDVDInfo,iParent,TRUE);
+		for (i = 0;i < pForyouDVDInfo->sForyouDVDInfo.pFileCount;i++)
+		{
+			if (i == globalIndex)
+			{
+				if (iParent)
+				{
+					return iFolderCount + iFileCount + 1;
+				}
+				else
+				{
+					return iFolderCount + iFileCount;
+				}
+			}
+			if (iParent == pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[i].parentFolderIndex)
+			{
+				iFileCount++;
+			}
+		}
+	}
+	return -1;
+}
+
+void OnDataRecv(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo, BYTE data)
+{
+	UINT i,j;
+	switch (pForyouDVDInfo->DVDInfoFrameStatus)
+	{
+	case 0:
+		if (data == 0xff)
+		{
+			pForyouDVDInfo->DVDInfoFrameStatus = 1;
+		}
+		break;
+	case 1:
+		if (data == 0x55) 
+		{
+			pForyouDVDInfo->DVDInfoFrameStatus = 2;
+		}
+		else 
+		{
+			pForyouDVDInfo->DVDInfoFrameStatus = 0;
+		}
+		break;
+	case 2:
+		if(data == 0xff)//这个判断为了解决华阳连发两次FF 55
+		{
+			pForyouDVDInfo->DVDInfoFrameStatus = 1;
+			break;
+		}
+		pForyouDVDInfo->DVDInfoFrameStatus = 3;
+		pForyouDVDInfo->DVDInfoFrameChecksum = pForyouDVDInfo->DVDInfoFrameLengthMax = data;
+		pForyouDVDInfo->DVDInfoFrameLength = 0;
+		break;
+	case 3:
+		if (pForyouDVDInfo->DVDInfoFrameLength < pForyouDVDInfo->DVDInfoFrameLengthMax) 
+		{
+			pForyouDVDInfo->DVDInfoFrameBuff[pForyouDVDInfo->DVDInfoFrameLength] = data;
+			pForyouDVDInfo->DVDInfoFrameChecksum += data;
+			pForyouDVDInfo->DVDInfoFrameLength ++;
+		}
+		else 
+		{
+			if (data == (BYTE)(0xff - pForyouDVDInfo->DVDInfoFrameChecksum)) 
+			{
+				if (pForyouDVDInfo->bFlyaudioDVD)
+				{
+					DealFlyaudioInfo(pForyouDVDInfo,pForyouDVDInfo->DVDInfoFrameBuff,pForyouDVDInfo->DVDInfoFrameLength);
+				}
+				else
+				{
+					DealDVDInfo(pForyouDVDInfo,pForyouDVDInfo->DVDInfoFrameBuff,pForyouDVDInfo->DVDInfoFrameLength);
+				}
+			}
+			else
+			{
+				DBG0(RETAILMSG(1, (TEXT("\r\nForyou COM CRC ERROR!!!!!!!!")));)
+				for (i = 0;i < pForyouDVDInfo->DVDInfoFrameLength;i++)
+				{
+					DBG0(RETAILMSG(1, (TEXT(" %x"),pForyouDVDInfo->DVDInfoFrameBuff[i]));)
+				}
+
+				for (j = 0;j < pForyouDVDInfo->DVDInfoFrameLength;j++)//CRC错误时，尽量减少损失
+				{
+					if (0xFF == pForyouDVDInfo->DVDInfoFrameBuff[j])
+					{
+						memcpy(pForyouDVDInfo->DVDInfoFrameCRCErrorTailBuff
+							,&pForyouDVDInfo->DVDInfoFrameBuff[j]
+						,pForyouDVDInfo->DVDInfoFrameLength - j);
+						pForyouDVDInfo->DVDInfoFrameCRCErrorTailLength = pForyouDVDInfo->DVDInfoFrameLength - j;
+
+						DBG0(RETAILMSG(1, (TEXT("\r\nForyou Tail")));)
+						for (i = 0;i < pForyouDVDInfo->DVDInfoFrameCRCErrorTailLength;i++)
+						{
+							DBG0(RETAILMSG(1, (TEXT(" %x"),pForyouDVDInfo->DVDInfoFrameCRCErrorTailBuff[i]));)
+						}
+						break;
+					}
+				}
+			}
+			pForyouDVDInfo->DVDInfoFrameStatus = 0;
+		}
+		break;
+	default:
+		pForyouDVDInfo->DVDInfoFrameStatus = 0;
+		break;
+	}
+}
+
+void OnCommRecv(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo, BYTE *buf, UINT buflen)
+{
+	for (UINT i = 0; i < buflen; i++)
+	{
+		if (pForyouDVDInfo->DVDInfoFrameCRCErrorTailLength)
+		{
+			for (UINT j = 0;j < pForyouDVDInfo->DVDInfoFrameCRCErrorTailLength;j++)
+			{
+				OnDataRecv(pForyouDVDInfo,pForyouDVDInfo->DVDInfoFrameCRCErrorTailBuff[j]);
+			}
+			pForyouDVDInfo->DVDInfoFrameCRCErrorTailLength = 0;
+		}
+		OnDataRecv(pForyouDVDInfo,buf[i]);
+	}
+	/* 取得控件指针 */
+}
+
+static DWORD WINAPI ThreadFlyDVDCommProc(LPVOID pContext)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)pContext;
+	BOOL fReadState;
+	DWORD dwCommModemStatus;
+	DWORD dwLength;
+	COMSTAT ComStat;
+	DWORD dwErrorFlags;
+	BYTE *recvBuf;
+	recvBuf = new BYTE[DATA_BUFF_COMM_LENGTH];
+
+	if (!pForyouDVDInfo->hDVDComm || pForyouDVDInfo->hDVDComm == INVALID_HANDLE_VALUE
+		|| pForyouDVDInfo->bKillFlyDVDCommThread)
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyDVDCommProc exit with com error")));)
+		return 0;
+	}
+	else
+	{
+		DBG1(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyDVDCommProc start")));)
+
+	}
+
+	while (!pForyouDVDInfo->bKillFlyDVDCommThread)
+	{
+		//等待串口的事件发生
+		WaitCommEvent (pForyouDVDInfo->hDVDComm, &dwCommModemStatus, 0);
+		if (dwCommModemStatus & EV_RXCHAR) 
+		{
+			ClearCommError(pForyouDVDInfo->hDVDComm,&dwErrorFlags,&ComStat);
+			//cbInQue返回在串行驱动程序输入队列中的字符数
+			dwLength=ComStat.cbInQue;
+			if(dwLength>0)
+			{
+				//从串口读取数据
+
+				fReadState=ReadFile(pForyouDVDInfo->hDVDComm,recvBuf,DATA_BUFF_COMM_LENGTH,&dwLength,NULL);
+				if(!fReadState)
+				{
+					//不能从串口读取数据
+					DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyDVDCommProc cannot read data!")));)
+				}
+				else
+				{
+					//把数据赋值给全局变量
+					OnCommRecv(pForyouDVDInfo,recvBuf,dwLength);
+				}
+			}     
+
+		}
+
+		GetCommModemStatus (pForyouDVDInfo->hDVDComm, &dwCommModemStatus);
+	}
+	delete []recvBuf;
+	DBG1(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyDVDCommProc exit")));)
+	return 0;
+}
+
+BOOL InitDCB(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	DCB PortDCB;
+//	DWORD dwError;
+	PortDCB.DCBlength = sizeof (DCB);     
+	//得到端口的默认设置信息
+	GetCommState (pForyouDVDInfo->hDVDComm, &PortDCB);
+
+	//改变DCB结构设置
+
+	PortDCB.BaudRate = 57600;               //波特率 
+	PortDCB.fBinary = TRUE;                 //Win32不支持非二进制串行传输模式，必须为TRUE 
+	PortDCB.fParity = FALSE;                 //启用奇偶校验 
+	PortDCB.fOutxCtsFlow = FALSE;            //串行端口的输出由CTS线控制
+	PortDCB.fOutxDsrFlow = FALSE;           //关闭串行端口的DSR流控制 
+	PortDCB.fDtrControl = DTR_CONTROL_DISABLE;   //启用DTR线
+	PortDCB.fDsrSensitivity = FALSE;        //如果设为TRUE将忽略任何输入的字节，除非DSR线被启用 
+	//PortDCB.fTXContinueOnXoff = TRUE;       //当为TRUE时，如果接收缓冲区已满且驱动程序已传送XOFF字符，将使驱动程序停止传输字符
+	PortDCB.fTXContinueOnXoff = FALSE;
+	PortDCB.fOutX = FALSE;                  //设为TRUE指定XON/XOFF控制被用于控制串行输出 
+	PortDCB.fInX = FALSE;                   //设为TRUE指定XON/XOFF控制被用于控制串行输入 
+	PortDCB.fErrorChar = FALSE;             //WINCE串行驱动程序的默认执行将忽略这个字段 
+	PortDCB.fNull = FALSE;                  //设为TRUE将使串行驱动程序忽略收到的空字节 
+	PortDCB.fRtsControl = RTS_CONTROL_DISABLE;   //启用RTS线 
+	PortDCB.fAbortOnError = FALSE;          //WINCE串行驱动程序的默认执行将忽略这个字段
+	PortDCB.ByteSize = 8;                   //每字节的位数 
+	PortDCB.Parity = NOPARITY;              //无奇偶校验 
+	PortDCB.StopBits = ONESTOPBIT;          //每字节一位停止位 
+	//根据DCB结构配置端口 
+	if (!SetCommState (pForyouDVDInfo->hDVDComm, &PortDCB))
+	{
+		//不能配置串行端口
+		DBG0(RETAILMSG(1, (TEXT("FlyAudio ForyouDVD cann't set DCB!")));)
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+BOOL InitCommTimeouts(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	COMMTIMEOUTS CommTimeouts;
+//	DWORD dwError;
+
+	//得到超时参数
+	GetCommTimeouts (pForyouDVDInfo->hDVDComm, &CommTimeouts);
+	//改变COMMTIMEOUTS结构设置
+	CommTimeouts.ReadIntervalTimeout = MAXDWORD;  
+	CommTimeouts.ReadTotalTimeoutMultiplier = 0;  
+	CommTimeouts.ReadTotalTimeoutConstant = 0;    
+	CommTimeouts.WriteTotalTimeoutMultiplier = 0;  
+	CommTimeouts.WriteTotalTimeoutConstant = 0;    
+	//设置端口超时值 
+	if (!SetCommTimeouts (pForyouDVDInfo->hDVDComm, &CommTimeouts))
+	{
+		//不能设置超时值
+		DBG0(RETAILMSG(1, (TEXT("FlyAudio ForyouDVD cann't set timeout para!")));)
+		return FALSE;
+	}
+	return TRUE;
+}
+
+void closeDVDComm(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	pForyouDVDInfo->bKillFlyDVDCommThread = TRUE;
+
+	SetCommMask(pForyouDVDInfo->hThreadHandleFlyDVDComm,0);
+
+	if (pForyouDVDInfo->hThreadHandleFlyDVDComm)
+	{
+		TerminateThread(pForyouDVDInfo->hThreadHandleFlyDVDComm,0);
+		CloseHandle(pForyouDVDInfo->hThreadHandleFlyDVDComm);
+	}
+
+	//清除端口上指定信号的状态
+	EscapeCommFunction(pForyouDVDInfo->hDVDComm,CLRDTR);
+	EscapeCommFunction(pForyouDVDInfo->hDVDComm,CLRRTS);
+	//清除驱动程序内部的发送和接收队列
+	PurgeComm(pForyouDVDInfo->hDVDComm,PURGE_TXCLEAR|PURGE_RXCLEAR);
+	//关闭串口
+	CloseHandle(pForyouDVDInfo->hDVDComm);
+	pForyouDVDInfo->hDVDComm = NULL;
+}
+
+void openDVDComm(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	if (pForyouDVDInfo->hDVDComm)
+	{
+		return;
+	}
+	//打开串口
+	pForyouDVDInfo->hDVDComm = CreateFile(TEXT("COM7:"), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	DBG0(RETAILMSG(1, (TEXT("FlyAudio ForyouDVD open com7!")));)
+
+	if(pForyouDVDInfo->hDVDComm == INVALID_HANDLE_VALUE)
+	{
+		pForyouDVDInfo->hDVDComm = NULL;
+		DBG0(RETAILMSG(1, (TEXT("FlyAudio ForyouDVD cann't open com!")));)
+		return;
+	}
+	//指定端口监测的事件集
+	SetCommMask(pForyouDVDInfo->hDVDComm, EV_RXCHAR);					// 串口事件:接收到一个字符 	
+	//分配设备缓冲区
+	SetupComm(pForyouDVDInfo->hDVDComm, 1024*64, 512);					// 设置接收与发送的缓冲区大小 
+	//初始化缓冲区中的信息
+	PurgeComm(pForyouDVDInfo->hDVDComm,PURGE_TXCLEAR|PURGE_RXCLEAR);
+
+	//配置串行端口
+	if(!InitDCB(pForyouDVDInfo))
+	{
+		return;
+	}
+
+	//设置端口超时值
+	if(!InitCommTimeouts(pForyouDVDInfo))
+	{
+		return;
+	}
+
+	//设置端口上指定信号的状态
+	// SETDTR: 发送DTR (data-terminal-ready)信号
+	// SETRTS: 发送RTS (request-to-send)信号
+	EscapeCommFunction (pForyouDVDInfo->hDVDComm, SETDTR);
+	EscapeCommFunction (pForyouDVDInfo->hDVDComm, SETRTS);
+
+	pForyouDVDInfo->bKillFlyDVDCommThread = FALSE;
+	DWORD dwThreadID;
+	pForyouDVDInfo->hThreadHandleFlyDVDComm = 
+		CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+		0,//初始化线程栈的大小，缺省为与主线程大小相同
+		(LPTHREAD_START_ROUTINE)ThreadFlyDVDCommProc, //线程的全局函数
+		pForyouDVDInfo, //此处传入了主框架的句柄
+		0, &dwThreadID );
+	DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyDVDCommProc ID:%x"),dwThreadID));)
+
+	if (NULL == pForyouDVDInfo->hThreadHandleFlyDVDComm)
+	{
+		DBG1(RETAILMSG(1, (TEXT("FlyAudio ForyouDVD CreateThread ThreadFlyDVDCommProc!")));)
+		closeDVDComm(pForyouDVDInfo);
+		return;
+	}
+	DBG1(RETAILMSG(1, (TEXT("FlyAudio ForyouDVD Comm init OK!")));)
+}
+
+static VOID FlyAudioReturnToUserPutToBuff(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE data)
+{
+	pForyouDVDInfo->buffToUser[pForyouDVDInfo->buffToUserHx++] = data;
+	if (pForyouDVDInfo->buffToUserHx >= DATA_BUFF_TOUSER_LENGTH)
+	{
+		pForyouDVDInfo->buffToUserHx = 0;
+	}
+	if (pForyouDVDInfo->buffToUserHx == pForyouDVDInfo->buffToUserLx)
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\n\r\n\r\nForyouDVD Buff to user overflow!!!\r\n\r\n\r\n")));)
+	}
+}
+
+static VOID FlyAudioReturnToUser(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *buf,UINT len)
+{
+	BYTE crc;
+	UINT i;
+//	if (0x27 != buf[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD return WinCE:")));)
+		for (i = 0;i < len;i++)
+		{
+			DBG2(RETAILMSG(1, (TEXT(" %X"),buf[i]));)
+		}
+	}
+	EnterCriticalSection(&pForyouDVDInfo->hCSSendToUser);
+	FlyAudioReturnToUserPutToBuff(pForyouDVDInfo,0xFF);
+	FlyAudioReturnToUserPutToBuff(pForyouDVDInfo,0x55);
+	FlyAudioReturnToUserPutToBuff(pForyouDVDInfo,len+1);
+	crc = len + 1;
+	for(i = 0;i < len;i++)
+	{
+		FlyAudioReturnToUserPutToBuff(pForyouDVDInfo,buf[i]);
+		crc += buf[i];
+	}
+	FlyAudioReturnToUserPutToBuff(pForyouDVDInfo,crc);
+	LeaveCriticalSection(&pForyouDVDInfo->hCSSendToUser);
+	SetEvent(pForyouDVDInfo->hBuffToUserDataEvent);
+}
+
+void returnDVDVersion(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *p,UINT len)
+{
+	BYTE buff[18];
+	buff[0] = 0x2F;
+	memcpy(&buff[1],p,len);
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,len+1);
+}
+
+void returnDVDDevicePowerMode(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE bPower)
+{
+	BYTE buff[2];
+	buff[0] = 0x01;
+	buff[1] = bPower;
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,2);
+}
+
+void returnDVDDeviceWorkMode(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE bWork)
+{
+	BYTE buff[2];
+	buff[0] = 0x02;
+	buff[1] = bWork;
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,2);
+}
+
+void returnDVDDevicePlayDevice(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iDevice)
+{
+	BYTE buff[2];
+	buff[0] = 0x20;
+	buff[1] = iDevice;
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,2);
+}
+
+void returnDVDDeviceActionState(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iDevice,BYTE iState)
+{
+	BYTE buff[3];
+	buff[0] = 0x21;
+	buff[1] = iDevice;
+	buff[2] = iState;
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,3);
+}
+
+void returnDVDDeviceContent(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iContent)
+{
+	BYTE buff[2];
+	buff[0] = 0x22;
+	buff[1] = iContent;
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,2);
+}
+
+void returnDVDDeviceMedia(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iDisc,BYTE iFile)
+{
+	BYTE buff[3];
+	buff[0] = 0x23;
+	buff[1] = iDisc;buff[2] = iFile;
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,3);
+}
+
+void returnDVDTotalTitleTrack(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT iTitle,UINT iTrack)
+{
+	BYTE buff[5];
+	buff[0] = 0x24;
+	if (iTitle == 0xFF || iTrack == 0xFFFF)
+	{
+		buff[1] = 0;buff[2] = 0;buff[3] = 0;buff[4] = 0;
+	} 
+	else
+	{
+		buff[1] = iTitle >> 8;buff[2] = iTitle;buff[3] = iTrack >> 8;buff[4] = iTrack;
+	}
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,5);
+}
+
+void returnDVDCurrentTitleTrack(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT iTitle,UINT iTrack)
+{
+	BYTE buff[5];
+	buff[0] = 0x25;
+	if (iTitle == 0xFF)
+	{
+		iTitle = 0;
+	}
+	if (iTrack == 0xFFFF)
+	{
+		iTrack = 0;
+	}
+
+	buff[1] = iTitle >> 8;buff[2] = iTitle;buff[3] = iTrack >> 8;buff[4] = iTrack;
+
+	if (!pForyouDVDInfo->bFlyaudioDVD
+		&& 0 == iTitle && 0 == iTrack)
+	{
+		return;
+	}
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,5);
+}
+
+void returnDVDTotalTime(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iHour,BYTE iMin,BYTE iSec)
+{
+	BYTE buff[4];
+	buff[0] = 0x26;
+	if (iHour == 86 && iMin == 45 && iSec == 19)
+	{
+		buff[1] = 0;buff[2] = 0;buff[3] = 0;
+	} 
+	else
+	{
+		buff[1] = iHour;buff[2] = iMin;buff[3] = iSec;
+	}
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,4);
+}
+
+void returnDVDCurrentTime(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iHour,BYTE iMin,BYTE iSec)
+{
+	BYTE buff[4];
+	buff[0] = 0x27;
+	if (iHour == 86 && iMin == 45 && iSec == 19)
+	{
+		buff[1] = 0;buff[2] = 0;buff[3] = 0;
+	} 
+	else
+	{
+		buff[1] = iHour;buff[2] = iMin;buff[3] = iSec;
+	}
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,4);
+}
+
+void returnDVDPlayStatusSpeed(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iPlayStatus,BYTE iPlaySpeed)
+{
+	BYTE buff[3];
+	buff[0] = 0x28;
+	DBG1(RETAILMSG(1, (TEXT("\r\nFlyAudio returnDVDPlayStatusSpeed LDH:iPlayStatus = %d iPlaySpeed= %d")));)
+	buff[1] = iPlayStatus;buff[2] = iPlaySpeed;
+
+	pForyouDVDInfo->sForyouDVDInfo.bDVDResponseState = iPlayStatus;
+	procDVDStop(pForyouDVDInfo,TRUE);
+
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,3);
+}
+
+void returnDVDPlayMode(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iPlayMode)
+{
+	BYTE buff[2];
+	buff[0] = 0x11;
+
+	buff[1] = iPlayMode;
+	
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,2);
+}
+
+void returnDVDCurrentFolderInfo(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT totalCount,UINT folderCount,BOOL bRoot)
+{
+	BYTE buff[1+2+2+1];
+	buff[0] = 0x12;
+
+	buff[1] = totalCount >> 8;
+	buff[2] = totalCount;
+
+	buff[3] = folderCount >> 8;
+	buff[4] = folderCount;
+
+	if (bRoot)
+	{
+		buff[5] = 1;
+	} 
+	else
+	{
+		buff[5] = 0;
+	}
+
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,6);
+}
+
+void returnDVDFileFolderInfo(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bFolder,BYTE *pName,UINT nameLength,UINT index,UINT globalIndex)
+{
+	BYTE buff[6+256];
+	buff[0] = 0x13;
+
+	buff[1] = index >> 8;buff[2] = index;
+	buff[3] = globalIndex >> 8;buff[4] = globalIndex;
+	if (bFolder)
+	{
+		buff[5] = 0;
+	}
+	else
+	{
+		buff[5] = 1;
+	}
+	memcpy(&buff[6],pName,nameLength);
+
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,nameLength+6);
+}
+
+void returnDVDNowPlayingFileInfo(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,P_FOLDER_FILE_TREE_LIST p,UINT index,UINT globalIndex)
+{
+	BYTE buff[6+256];
+	buff[0] = 0x2A;
+
+	buff[1] = index >> 8;buff[2] = index;
+	buff[3] = globalIndex >> 8;buff[4] = globalIndex;
+	buff[5] = p->extension;
+	memcpy(&buff[6],p->name,p->nameLength);
+
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,p->nameLength+6);
+}
+
+void returnDVDNowPlayingInFolderName(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,P_FOLDER_FILE_TREE_LIST p)
+{
+	BYTE buff[1+256];
+	buff[0] = 0x29;
+
+	memcpy(&buff[1],p->name,p->nameLength);
+
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,p->nameLength+1);
+}
+
+void returnDVDErrorStatus(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iError)
+{
+	BYTE buff[2];
+	buff[0] = 0x10;
+
+	buff[1] = iError;
+
+	FlyAudioReturnToUser(pForyouDVDInfo,buff,2);
+}
+
+void DVDCmdPrintf(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *buf,UINT len)
+{
+	BYTE sendBuf[256];
+	BYTE checksum;
+	UINT i;	
+	DWORD bufSendLength;
+
+	if (0x83 == buf[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("Fly DVD 0x83:%d"),buf[1]));)
+	} 
+	else if (0x85 == buf[0])
+	{
+	}
+	else
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD Control to DVD:")));)
+		for (i = 0; i < len; i++)
+		{
+			DBG2(RETAILMSG(1, (TEXT(" %x"),buf[i]));)
+		}
+	}
+
+	sendBuf[0] = 0xFF;
+	sendBuf[1] = 0x55;
+	sendBuf[2] = len;
+	checksum = len;
+	for(i = 0;i < len;i++)
+	{
+		sendBuf[3+i] = buf[i];
+		checksum += buf[i];
+	}
+	sendBuf[3+i] = 0xFF - checksum;
+	WriteFile(pForyouDVDInfo->hDVDComm,sendBuf,len+4,&bufSendLength,NULL);
+}
+
+void control_DVD_Video_Aspect_Radio(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE para)
+{
+	BYTE buff[] = {0x09,0x00};
+
+	buff[1] = para;
+
+	DVDCmdPrintf(pForyouDVDInfo,buff,2);
+}
+
+void control_DVD_Set_View_Mode(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE para)
+{
+	BYTE buff[] = {0x0A,0x00};
+
+	buff[1] = para;
+
+	DVDCmdPrintf(pForyouDVDInfo,buff,2);
+}
+
+void control_DVD_PlayBack_DisplayInfo_State_Request(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bOn)
+{
+	BYTE buff[] = {0x89,0x00};
+	if (bOn)
+	{
+		buff[1] = 0x01;
+	} 
+	else
+	{
+		buff[1] = 0x00;
+	}
+	DVDCmdPrintf(pForyouDVDInfo,buff,2);
+}
+
+void control_DVD_IR_CMD(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE IRCMD)
+{
+	BYTE buff[] = {0x6B,0x00};
+	buff[1] = IRCMD;
+	DVDCmdPrintf(pForyouDVDInfo,buff,2);
+}
+
+void control_DVD_ReqMechanismState(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iDevice)
+{
+	BYTE buff[] = {0x83,0x00};
+	buff[1] = iDevice;
+	DVDCmdPrintf(pForyouDVDInfo,buff,2);
+}
+
+void control_DVD_ReqMediaState(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	BYTE buff[] = {0x85};
+	DVDCmdPrintf(pForyouDVDInfo,buff,1);
+}
+
+void control_DVD_ReqDVDSoftwareVersion(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	BYTE buff[] = {0x9A};
+	DVDCmdPrintf(pForyouDVDInfo,buff,1);
+}
+
+void control_DVD_ReqFileFolderCount(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	BYTE buff[] = {0x9B};
+	DVDCmdPrintf(pForyouDVDInfo,buff,1);
+}
+
+void control_DVD_ReqFileFolderDetailedInfo(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE bFile,UINT iAbs,UINT iOffset)
+{
+	BYTE buff[6];
+	buff[0] = 0x9D;
+	buff[1] = bFile;
+	buff[2] = iAbs >> 8;buff[3] = iAbs;
+	buff[4] = iOffset >> 8;buff[5] = iOffset;
+	DVDCmdPrintf(pForyouDVDInfo,buff,6);
+}
+
+void control_DVD_PlayFileByAbsCount(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT parentIndex,UINT index)
+{
+	BYTE buff[6];
+	buff[0] = 0x70;
+	buff[1] = parentIndex >> 8;buff[2] = parentIndex;
+	buff[3] = index >> 8;buff[4] = index;
+	buff[5] = pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[index].extension;
+	if (pForyouDVDInfo->bFlyaudioDVD)
+	{
+		DVDCmdPrintf(pForyouDVDInfo,buff,6);
+	}
+	else
+	{
+		DVDCmdPrintf(pForyouDVDInfo,buff,5);
+	}
+}
+
+void control_DVD_ReqHighLightFileIndex(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	BYTE buff[] = {0x96};
+	DVDCmdPrintf(pForyouDVDInfo,buff,1);
+}
+
+void control_DVD_ReqRegionCode(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	BYTE buff[] = {0x82,0x02};
+	DVDCmdPrintf(pForyouDVDInfo,buff,2);
+}
+
+void control_DVD_ID3CDText(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iWhat,UINT iStart,UINT iCount)
+{
+	BYTE buff[] = {0x8C,0x51,0x00,0x01,0x00,0x01};
+
+	buff[1] = iWhat;
+
+	buff[2] = iStart >> 8;
+	buff[3] = iStart;
+
+	buff[4] = iCount >> 8;
+	buff[5] = iCount;
+	DVDCmdPrintf(pForyouDVDInfo,buff,6);
+}
+
+void control_DVD_ControlRegionCode(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE iRegionCode)
+{
+	BYTE buff[] = {0x02,0x09};
+	buff[1] = iRegionCode;
+	DVDCmdPrintf(pForyouDVDInfo,buff,2);
+}
+
+void control_DVD_VideoSetup(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	BYTE buff[] = {0x03,0x00,0x00,0x00,0x14,20,16,9,9};
+	//cmd ,CVBS+PAL,16:9,full screen,standard,contrast,brightness,hue,saturation
+	DVDCmdPrintf(pForyouDVDInfo,buff,9);
+}
+
+void control_DVD_JumpNextN(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT iJumpN)
+{
+	BYTE buff[] = {0x4F,0x00,0x00};
+	buff[1] = iJumpN >> 8;
+	buff[2] = iJumpN;
+	DVDCmdPrintf(pForyouDVDInfo,buff,3);
+}
+
+void control_DVD_JumpPrevN(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT iJumpN)
+{
+	BYTE buff[] = {0x50,0x00,0x00};
+	buff[1] = iJumpN >> 8;
+	buff[2] = iJumpN;
+	DVDCmdPrintf(pForyouDVDInfo,buff,3);
+}
+
+void structDVDInfoInit(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bInitAll)
+{
+
+	if (bInitAll)
+	{
+		pForyouDVDInfo->sForyouDVDInfo.MechanismInitialize = FALSE;
+		pForyouDVDInfo->sForyouDVDInfo.bDeviceRec89 = 0;
+	}
+	DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD para init %d"),bInitAll));)
+
+	pForyouDVDInfo->sForyouDVDInfo.DVDReqStep = 0;
+	pForyouDVDInfo->sForyouDVDInfo.bForceExecReqStep = FALSE;
+
+	pForyouDVDInfo->sForyouDVDInfo.bQuickJumpNext = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = 0;
+	pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = 0;
+	pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextTimer = 0;
+
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[0] = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[1] = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[2] = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3] = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[0] = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[1] = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[2] = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[3] = 0xFF;
+
+	pForyouDVDInfo->sForyouDVDInfo.CurrentReqMechanismCircle = 0;
+
+	pForyouDVDInfo->sForyouDVDInfo.MediaDiscType = 0;
+	pForyouDVDInfo->sForyouDVDInfo.MediaFileType = 0;
+	pForyouDVDInfo->sForyouDVDInfo.MediaVideoInfo = 0;
+	pForyouDVDInfo->sForyouDVDInfo.MediaAudioSampleFrequency = 0;
+	pForyouDVDInfo->sForyouDVDInfo.MediaAudioCoding = 0;
+
+	pForyouDVDInfo->sForyouDVDInfo.preVideoAspect = 0xFF;
+	pForyouDVDInfo->sForyouDVDInfo.curVideoAspect = 0xFF;
+
+	pForyouDVDInfo->sForyouDVDInfo.CurrentTitle = -1;
+	pForyouDVDInfo->sForyouDVDInfo.CurrentChar = -1;
+	pForyouDVDInfo->sForyouDVDInfo.TotalTitle = 0;
+	pForyouDVDInfo->sForyouDVDInfo.TotalChar = 0;
+	pForyouDVDInfo->sForyouDVDInfo.EscapeHour = 0;
+	pForyouDVDInfo->sForyouDVDInfo.EscapeMinute = 0;
+	pForyouDVDInfo->sForyouDVDInfo.EscapeSecond = 0;
+	pForyouDVDInfo->sForyouDVDInfo.TotalHour = 0;
+	pForyouDVDInfo->sForyouDVDInfo.TotalMinute = 0;
+	pForyouDVDInfo->sForyouDVDInfo.TotalSecond = 0;
+	pForyouDVDInfo->sForyouDVDInfo.PlayMode = 0;
+	pForyouDVDInfo->sForyouDVDInfo.AudioType = 0;
+	pForyouDVDInfo->sForyouDVDInfo.PlaySpeed = 0;
+	pForyouDVDInfo->sForyouDVDInfo.PlayStatus = 0;
+	pForyouDVDInfo->sForyouDVDInfo.DVDRoot = 0;
+	pForyouDVDInfo->sForyouDVDInfo.DeviceStatus = 0;
+	pForyouDVDInfo->sForyouDVDInfo.DeviceType = 0;
+	pForyouDVDInfo->sForyouDVDInfo.HaveDisc = 0;
+	pForyouDVDInfo->sForyouDVDInfo.HaveUSB = 0;
+	pForyouDVDInfo->sForyouDVDInfo.HaveSD = 0;
+
+	pForyouDVDInfo->sForyouDVDInfo.pBStartGetFolderFile = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pBHaveGetFolderFile = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pReturnE8 = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pReturnEAFolder = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pReturnEAFile = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pFolderCount = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pFileCount = 0;
+	pForyouDVDInfo->sForyouDVDInfo.bFinishGetFileFolderEB = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.bRecFileFolderUseEB = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pRecFolderCount = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pRecFileCount = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pLastRecFolderIndex = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pLastRecFileIndex = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pBFolderFileListFolderErrorCheck = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pBFolderFileListFileErrorCheck = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pBGetFolderFinish = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pBGetFileFinish = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pBGetFileFolderFinish = FALSE;
+	listFileFolderClearAll(pForyouDVDInfo,TRUE);
+	listFileFolderClearAll(pForyouDVDInfo,FALSE);
+	pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount = 0;
+	pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount = -1;
+	pForyouDVDInfo->sForyouDVDInfo.pNowPlayingInWhatFolder = -1;
+
+	pForyouDVDInfo->sForyouDVDInfo.bRecE0AndNeedProc = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.bNeedSend8CTime = 0;
+
+	pForyouDVDInfo->sForyouDVDInfo.iDVDReturnRegionCode = 0xFF;//缺省
+
+	memset(pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion,0,6);
+
+	pForyouDVDInfo->sForyouDVDInfo.bDVDRequestState = 0;
+	pForyouDVDInfo->sForyouDVDInfo.bDVDResponseState = 0;
+	pForyouDVDInfo->sForyouDVDInfo.iDVDStateCheckTime = 0;
+#if FORYOU_DVD_BUG_FIX
+	pForyouDVDInfo->sForyouDVDInfo.bNeedReturnNoDiscAfterClose = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.iNeedReturnNoDiscAfterCloseTime = 0;
+#endif
+}
+
+void transDVDInfoCB(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *p,UINT len)
+{
+	if (p[0] > 3)
+	{
+		return;
+	}
+	if (0x00 == p[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD CB %x %x %x"),p[0],p[1],p[2]));)
+	}
+	else if (0x01 == p[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD CB       %x %x %x"),p[0],p[1],p[2]));)
+	}
+	else if (0x02 == p[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD CB             %x %x %x"),p[0],p[1],p[2]));)
+	}
+	else if (0x03 == p[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD CB                   %x %x %x"),p[0],p[1],p[2]));)
+	}
+	if (pForyouDVDInfo->sForyouDVDInfo.bFilterDiscInFirstPowerUp)//过滤DiscIn
+	{
+		if (0x00 == p[0])//过滤碟机
+		{
+			if (0x00 == p[1])//开机无碟
+			{
+				pForyouDVDInfo->sForyouDVDInfo.bFilterDiscInFirstPowerUp = FALSE;
+				DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD DVD DiscIn Filter End With Real NoDisc")));)
+			}
+			else if (0x03 == p[1])//开始过滤
+			{
+				pForyouDVDInfo->sForyouDVDInfo.bFilterDiscIn = TRUE;
+				DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD DVD DiscIn Filter")));)
+				return;
+			}
+			else
+			{
+				if (pForyouDVDInfo->sForyouDVDInfo.bFilterDiscIn)//过滤完成
+				{
+					pForyouDVDInfo->sForyouDVDInfo.bFilterDiscInFirstPowerUp = FALSE;
+					DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD DVD DiscIn Filter End")));)
+				}
+			}
+		}
+	}
+#if FORYOU_DVD_BUG_FIX
+	if (0x00 == p[0])
+	{
+		if (0x03 == p[1])
+		{
+			pForyouDVDInfo->sForyouDVDInfo.bNeedReturnNoDiscAfterClose = TRUE;
+			pForyouDVDInfo->sForyouDVDInfo.iNeedReturnNoDiscAfterCloseTime = GetTickCount();
+		}
+	}
+#endif
+	if (3 != p[0])
+	{
+		if (pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[p[0]] != p[1])
+		{
+			if (0x00 == p[0])//DISC LED Flash
+			{
+				if (0x02 == p[1] && pForyouDVDInfo->sForyouDVDInfo.bLEDFlashAble)
+				{
+					pForyouDVDInfo->sForyouDVDInfo.bLEDFlashAble = FALSE;
+					DBG1(RETAILMSG(1, (TEXT("\r\nForyouDVD LED Flash")));)
+					pForyouDVDInfo->sForyouDVDInfo.LEDFlash = TRUE;
+					SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDLEDControlEvent);
+				}
+				else
+				{
+					pForyouDVDInfo->sForyouDVDInfo.bLEDFlashAble = TRUE;
+				}
+			}
+			pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[p[0]] = p[1];
+			returnDVDDeviceActionState(pForyouDVDInfo,p[0],pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[p[0]]);
+		}
+		if (pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[p[0]] != p[2])
+		{
+			pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[p[0]] = p[2];
+			if (p[0] == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice)
+			{
+				returnDVDDeviceContent(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[p[0]]);
+			}
+		}
+	}
+
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[p[0]] = p[1];
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[p[0]] = p[2];
+
+	if(pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[p[0]] != 0x09)
+	{
+		if (p[0] == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice)
+		{
+			structDVDInfoInit(pForyouDVDInfo,FALSE);
+		}
+	}
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[p[0]] = p[1];
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[p[0]] = p[2];
+	//if (3 == p[0])
+	//{
+	//	if (0x09 == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[3])//Disc
+	//	{
+	//		if (pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice != 0)
+	//		{
+	//			structDVDInfoInit(pForyouDVDInfo,FALSE);
+	//			pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice = 0;//Disc
+	//			returnDVDDevicePlayDevice(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice);
+	//		}
+	//	}
+	//	else if (0x08 == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[3])
+	//	{
+	//		if (pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice != 1)
+	//		{
+	//			structDVDInfoInit(pForyouDVDInfo,FALSE);
+	//			pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice = 1;//USB
+	//			returnDVDDevicePlayDevice(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice);
+	//		}
+	//	}
+	//	else
+	//	{
+	//		if (1 == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice)
+	//		{
+	//			structDVDInfoInit(pForyouDVDInfo,FALSE);
+	//			control_DVD_IR_CMD(pForyouDVDInfo,0x95);//切换到DVD
+	//		}
+	//	}
+	//}
+}
+
+void transDVDInfoCD(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *p,UINT len)
+{
+	if(pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3] != 0x09)//启动获取流程
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD CD Filter For Mechanism Not Ready")));)
+		return;
+	}
+
+	if ((pForyouDVDInfo->sForyouDVDInfo.MediaDiscType != (p[0] >> 4))
+		|| (pForyouDVDInfo->sForyouDVDInfo.MediaFileType != (p[0] & 0x0F)))
+	{
+		pForyouDVDInfo->sForyouDVDInfo.MediaDiscType = p[0] >> 4;
+		pForyouDVDInfo->sForyouDVDInfo.MediaFileType = p[0] & 0x0F;
+		returnDVDDeviceMedia(pForyouDVDInfo,
+			pForyouDVDInfo->sForyouDVDInfo.MediaDiscType,
+			pForyouDVDInfo->sForyouDVDInfo.MediaFileType);
+	}
+	pForyouDVDInfo->sForyouDVDInfo.MediaVideoInfo = p[1] >> 6;
+	pForyouDVDInfo->sForyouDVDInfo.MediaAudioSampleFrequency = (p[1] >> 3) & 0x07;
+	pForyouDVDInfo->sForyouDVDInfo.MediaAudioCoding = p[1] & 0x07;
+}
+
+void transDVDInfoD2(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *p,UINT len)
+{
+	pForyouDVDInfo->sForyouDVDInfo.bDeviceRec89 = GetTickCount();
+
+	pForyouDVDInfo->sForyouDVDInfo.HaveDisc = p[18];
+	pForyouDVDInfo->sForyouDVDInfo.HaveUSB = p[19];
+	pForyouDVDInfo->sForyouDVDInfo.HaveSD = p[20];
+
+	if (pForyouDVDInfo->sForyouDVDInfo.PlayMode != p[12])
+	{
+		pForyouDVDInfo->sForyouDVDInfo.PlayMode = p[12];
+		returnDVDPlayMode(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.PlayMode);
+	}
+
+	pForyouDVDInfo->sForyouDVDInfo.AudioType = p[13];
+
+	if (((pForyouDVDInfo->sForyouDVDInfo.PlaySpeed << 4) + pForyouDVDInfo->sForyouDVDInfo.PlayStatus) != p[14])
+	{
+		pForyouDVDInfo->sForyouDVDInfo.PlaySpeed = p[14] >> 4;
+		pForyouDVDInfo->sForyouDVDInfo.PlayStatus = p[14] & 0x0F;
+		returnDVDPlayStatusSpeed(pForyouDVDInfo,
+			pForyouDVDInfo->sForyouDVDInfo.PlayStatus,
+			pForyouDVDInfo->sForyouDVDInfo.PlaySpeed);
+	}
+
+	pForyouDVDInfo->sForyouDVDInfo.DVDRoot = p[15];
+
+	pForyouDVDInfo->sForyouDVDInfo.DeviceStatus = p[16];
+	pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismType[3] = p[17];
+	if (pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3] != pForyouDVDInfo->sForyouDVDInfo.DeviceStatus
+		|| pForyouDVDInfo->sForyouDVDInfo.DeviceType != p[17])
+	{
+		pForyouDVDInfo->sForyouDVDInfo.DeviceType = p[17];
+		pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3] = pForyouDVDInfo->sForyouDVDInfo.DeviceStatus;
+
+		if (0x00 == pForyouDVDInfo->sForyouDVDInfo.HaveDisc)
+		{
+			if (0x08 == pForyouDVDInfo->sForyouDVDInfo.DeviceType)
+			{
+				if (0xFF == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[1])
+				{
+					returnDVDDeviceActionState(pForyouDVDInfo,0x01,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3]);
+				}
+			}
+			else
+			{
+				if (0xFF == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[0])
+				{
+					returnDVDDeviceActionState(pForyouDVDInfo,0x00,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3]);
+				}
+			}
+		}
+	}
+
+	if (0x09 == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3])
+	{
+		if (pForyouDVDInfo->sForyouDVDInfo.CurrentChar != (p[1] * 256 + p[2])
+			|| pForyouDVDInfo->sForyouDVDInfo.CurrentTitle != p[0])
+		{
+			pForyouDVDInfo->sForyouDVDInfo.CurrentTitle = p[0];
+			pForyouDVDInfo->sForyouDVDInfo.CurrentChar = p[1] * 256 + p[2];
+			returnDVDCurrentTitleTrack(pForyouDVDInfo,
+				pForyouDVDInfo->sForyouDVDInfo.CurrentTitle,
+				pForyouDVDInfo->sForyouDVDInfo.CurrentChar);
+		}
+
+		if (pForyouDVDInfo->sForyouDVDInfo.TotalChar != (p[4] * 256 + p[5])
+			|| pForyouDVDInfo->sForyouDVDInfo.TotalTitle != p[3])
+		{
+			pForyouDVDInfo->sForyouDVDInfo.TotalTitle = p[3];
+			pForyouDVDInfo->sForyouDVDInfo.TotalChar = p[4] * 256 + p[5];
+			returnDVDTotalTitleTrack(pForyouDVDInfo,
+				pForyouDVDInfo->sForyouDVDInfo.TotalTitle,
+				pForyouDVDInfo->sForyouDVDInfo.TotalChar);
+		}
+
+		if (pForyouDVDInfo->sForyouDVDInfo.EscapeSecond != p[8]
+		|| pForyouDVDInfo->sForyouDVDInfo.EscapeMinute != p[7]
+		|| pForyouDVDInfo->sForyouDVDInfo.EscapeHour != p[6])
+		{
+			pForyouDVDInfo->sForyouDVDInfo.EscapeHour = p[6];
+			pForyouDVDInfo->sForyouDVDInfo.EscapeMinute = p[7];
+			pForyouDVDInfo->sForyouDVDInfo.EscapeSecond = p[8];
+			returnDVDCurrentTime(pForyouDVDInfo,
+				pForyouDVDInfo->sForyouDVDInfo.EscapeHour,
+				pForyouDVDInfo->sForyouDVDInfo.EscapeMinute,
+				pForyouDVDInfo->sForyouDVDInfo.EscapeSecond);
+		}
+
+		if (pForyouDVDInfo->sForyouDVDInfo.TotalSecond != p[11]
+		|| pForyouDVDInfo->sForyouDVDInfo.TotalMinute != p[10]
+		|| pForyouDVDInfo->sForyouDVDInfo.TotalHour != p[9])
+		{
+			pForyouDVDInfo->sForyouDVDInfo.TotalHour = p[9];
+			pForyouDVDInfo->sForyouDVDInfo.TotalMinute = p[10];
+			pForyouDVDInfo->sForyouDVDInfo.TotalSecond = p[11];
+			returnDVDTotalTime(pForyouDVDInfo,
+				pForyouDVDInfo->sForyouDVDInfo.TotalHour,
+				pForyouDVDInfo->sForyouDVDInfo.TotalMinute,
+				pForyouDVDInfo->sForyouDVDInfo.TotalSecond);
+		}
+	}
+
+	if (0x09 == pForyouDVDInfo->sForyouDVDInfo.DeviceType)//Disc
+	{
+		if (pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice != 0)
+		{
+			structDVDInfoInit(pForyouDVDInfo,FALSE);
+			pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice = 0;//Disc
+			returnDVDDevicePlayDevice(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice);
+		}
+	}
+	else if (0x08 == pForyouDVDInfo->sForyouDVDInfo.DeviceType)
+	{
+		if (pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice != 1)
+		{
+			structDVDInfoInit(pForyouDVDInfo,FALSE);
+			pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice = 1;//USB
+			returnDVDDevicePlayDevice(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice);
+		}
+	}
+	else
+	{
+		if (1 == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice)
+		{
+			structDVDInfoInit(pForyouDVDInfo,FALSE);
+			control_DVD_IR_CMD(pForyouDVDInfo,0x95);//切换到DVD
+		}
+	}
+
+	if(pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3] == 0x09)//启动获取流程
+	{
+		if(pForyouDVDInfo->sForyouDVDInfo.MediaDiscType == 0x02)//Clips
+		{
+			if(pForyouDVDInfo->sForyouDVDInfo.pBStartGetFolderFile == FALSE)
+			{
+				if (!pForyouDVDInfo->sForyouDVDInfo.pBHaveGetFolderFile)
+				{
+					pForyouDVDInfo->sForyouDVDInfo.pBHaveGetFolderFile = TRUE;
+					pForyouDVDInfo->sForyouDVDInfo.pBStartGetFolderFile = TRUE;
+					pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount = 0;
+					pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow = TRUE;
+
+					pForyouDVDInfo->sForyouDVDInfo.pBGetFolderFinish = FALSE;
+					pForyouDVDInfo->sForyouDVDInfo.pBGetFileFinish = FALSE;
+					DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD Start get folder and file list")));)
+				}
+				else
+				{
+					DBG2(RETAILMSG(1, (TEXT(" already get")));)
+				}
+			}
+			else
+			{
+				DBG2(RETAILMSG(1, (TEXT(" already start")));)
+			}
+		}
+		else
+		{
+			DBG2(RETAILMSG(1, (TEXT(" not clips")));)
+		}
+	}
+	else
+	{
+		DBG2(RETAILMSG(1, (TEXT(" not ready")));)
+	}
+}
+
+void transDVDInfoD5(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *p,UINT len)
+{
+	UINT i;
+	UINT iCount;
+	if (0x51 == p[0])
+	{
+		iCount = p[1] * 256 + p[2] - 1;
+		if (pForyouDVDInfo->sForyouDVDInfo.pFileCount)
+		{
+			if (iCount < pForyouDVDInfo->sForyouDVDInfo.pFileCount)
+			{
+				for (i = 3;i < len - 1;i+=2)
+				{
+					if (0 == p[i] && 0 == p[i+1])
+					{
+						break;
+					}
+					else
+					{
+						pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[i-3] = p[i+1];
+						pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].name[i-2] = p[i];
+						pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[iCount].nameLength = i - 1 + 2;
+					}
+				}
+				if (iCount == pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount)
+				{
+					returnDVDNowPlayingFileInfo(pForyouDVDInfo,
+						&pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount],
+						getSelectFolderFileIndexByGlobalIndexInParent(pForyouDVDInfo,FALSE,pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount)
+						,pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount);
+				}
+			}
+		}
+	}
+}
+
+void transDVDInfoE8(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *p,UINT len)
+{
+	pForyouDVDInfo->sForyouDVDInfo.pReturnE8 = TRUE;
+	pForyouDVDInfo->sForyouDVDInfo.pFileCount = p[2]*256 + p[3];
+	pForyouDVDInfo->sForyouDVDInfo.pFolderCount = p[0]*256 + p[1];
+	DBG2(RETAILMSG(1, (TEXT("\r\nDisc List Count File:%d Folder:%d")
+		,pForyouDVDInfo->sForyouDVDInfo.pFileCount
+		,pForyouDVDInfo->sForyouDVDInfo.pFolderCount));)
+
+	listFileFolderNewAll(pForyouDVDInfo,TRUE,pForyouDVDInfo->sForyouDVDInfo.pFileCount);
+	listFileFolderNewAll(pForyouDVDInfo,FALSE,pForyouDVDInfo->sForyouDVDInfo.pFolderCount);
+
+	pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow = TRUE;
+
+	SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDEvent);
+}
+
+void transDVDInfoEA(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *p,UINT len)
+{
+	DBG2(RETAILMSG(1, (TEXT("File:%d,C:%d,P:%d,L:%d"),p[4],p[0]*256 + p[1],p[2]*256 + p[3],len-6));)
+	if (p[4])
+	{
+		pForyouDVDInfo->sForyouDVDInfo.pReturnEAFile = TRUE;
+		pForyouDVDInfo->sForyouDVDInfo.pLastRecFileIndex = p[0]*256 + p[1];
+
+		listFileFolderStorageOne(pForyouDVDInfo,TRUE,p[0]*256 + p[1],p[2]*256 + p[3],p[5],&p[6],len-6);
+
+		if (pForyouDVDInfo->sForyouDVDInfo.pLastRecFileIndex == pForyouDVDInfo->sForyouDVDInfo.pFileCount - 1)
+		{
+			pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow = TRUE;
+		}
+	}
+	else
+	{
+		pForyouDVDInfo->sForyouDVDInfo.pReturnEAFolder = TRUE;
+		pForyouDVDInfo->sForyouDVDInfo.pLastRecFolderIndex = p[0]*256 + p[1];
+
+		listFileFolderStorageOne(pForyouDVDInfo,FALSE,p[0]*256 + p[1],p[2]*256 + p[3],p[5],&p[6],len-6);
+
+		if (pForyouDVDInfo->sForyouDVDInfo.pLastRecFolderIndex == pForyouDVDInfo->sForyouDVDInfo.pFolderCount - 1)
+		{
+			pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow = TRUE;
+		}
+	}
+	if (p[4])
+	{
+		if (p[0]*256 + p[1] == pForyouDVDInfo->sForyouDVDInfo.pFileCount - 1)
+		{
+			pForyouDVDInfo->sForyouDVDInfo.bForceExecReqStep = TRUE;
+			SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDEvent);
+		}
+	}
+	else
+	{
+		if (p[0]*256 + p[1] == pForyouDVDInfo->sForyouDVDInfo.pFolderCount - 1)
+		{
+			pForyouDVDInfo->sForyouDVDInfo.bForceExecReqStep = TRUE;
+			SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDEvent);
+		}
+	}
+}
+
+void procDVDInfoE0(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	pForyouDVDInfo->sForyouDVDInfo.bRecE0AndNeedProc = FALSE;
+	pForyouDVDInfo->sForyouDVDInfo.pNowPlayingInWhatFolder = pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount].parentFolderIndex;
+	returnDVDNowPlayingFileInfo(pForyouDVDInfo,
+		&pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount],
+		getSelectFolderFileIndexByGlobalIndexInParent(pForyouDVDInfo,FALSE,pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount)
+		,pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount);
+	returnDVDNowPlayingInFolderName(pForyouDVDInfo
+		,&pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount].parentFolderIndex]);
+}
+
+void DealDVDInfo(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *p,UINT length)
+{
+	UINT i;
+	//if (0xC1 != p[0] && 0xD2 != p[0] && 0xCB != p[0] && 0xCD != p[0])`
+	//{
+	//	DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD decode: %x %x"),p[0],p[1]));)
+	//}
+//	if (0xCB == p[0] || 0xD2 == p[0])
+	if (0xEA != p[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD decode:")));)
+		for (i = 0;i < length;i++)
+		{
+			DBG2(RETAILMSG(1, (TEXT(" %x"),p[i]));)
+		}
+	}
+	
+	pForyouDVDInfo->iAutoResetControlTime = GetTickCount();
+
+	switch (p[0])
+	{
+	case 0xDB:
+		if (2 == length && 0x00 == p[1])
+		{
+			pForyouDVDInfo->bFlyaudioDVD = TRUE;
+		}
+		else
+		{
+			pForyouDVDInfo->bFlyaudioDVD = FALSE;
+		}
+		pForyouDVDInfo->sForyouDVDInfo.MechanismInitialize = TRUE;
+		structDVDInfoInit(pForyouDVDInfo,FALSE);
+
+		//control_DVD_IR_CMD(pForyouDVDInfo,0x17);
+		//control_DVD_VideoSetup(pForyouDVDInfo);
+
+		control_DVD_PlayBack_DisplayInfo_State_Request(pForyouDVDInfo,TRUE);
+		returnDVDDeviceWorkMode(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.MechanismInitialize);
+		
+		pForyouDVDInfo->sForyouDVDInfo.bFilterDiscInFirstPowerUp = FALSE;//新的碟机程序解决了？
+		pForyouDVDInfo->sForyouDVDInfo.bFilterDiscIn = FALSE;
+		break;
+	case 0xC1:
+		//DBG2(RETAILMSG(1, (TEXT(" %x"),p[1]));)
+		if (0x06 == p[1] || 0x07 == p[1] || 0x08 == p[1] || 0x09 == p[1] || 0x0A == p[1])
+		{
+			returnDVDErrorStatus(pForyouDVDInfo,p[1]);
+		}
+		break;
+	case 0xC2:
+		pForyouDVDInfo->sForyouDVDInfo.iDVDReturnRegionCode = p[1];
+		if (pForyouDVDInfo->sForyouDVDInfo.iDVDReturnRegionCode
+			!= pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDRegionCode)//设置并重新查询
+		{
+			control_DVD_ControlRegionCode(pForyouDVDInfo,pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDRegionCode);
+			pForyouDVDInfo->sForyouDVDInfo.iDVDReturnRegionCode = 0xFF;//重新查询
+		}
+		break;
+	case 0xCC:
+		if (((pForyouDVDInfo->sForyouDVDInfo.PlaySpeed << 4) + pForyouDVDInfo->sForyouDVDInfo.PlayStatus) != p[1])
+		{
+			pForyouDVDInfo->sForyouDVDInfo.PlaySpeed = p[1] >> 4;
+			pForyouDVDInfo->sForyouDVDInfo.PlayStatus = p[1] & 0x0F;
+			returnDVDPlayStatusSpeed(pForyouDVDInfo,
+				pForyouDVDInfo->sForyouDVDInfo.PlayStatus,
+				pForyouDVDInfo->sForyouDVDInfo.PlaySpeed);
+		}
+		break;
+	case 0xCB:
+		transDVDInfoCB(pForyouDVDInfo,&pForyouDVDInfo->DVDInfoFrameBuff[1],length-1);
+		break;
+	case 0xCD:
+		transDVDInfoCD(pForyouDVDInfo,&pForyouDVDInfo->DVDInfoFrameBuff[1],length-1);
+		break;
+	case 0xD2:
+		transDVDInfoD2(pForyouDVDInfo,&pForyouDVDInfo->DVDInfoFrameBuff[1],length-1);
+		break;
+	case 0xD5:
+		transDVDInfoD5(pForyouDVDInfo,&pForyouDVDInfo->DVDInfoFrameBuff[1],length-1);
+		break;
+	case 0xE8:
+		transDVDInfoE8(pForyouDVDInfo,&pForyouDVDInfo->DVDInfoFrameBuff[1],length-1);
+		break;
+	case 0xEA:
+		transDVDInfoEA(pForyouDVDInfo,&pForyouDVDInfo->DVDInfoFrameBuff[1],length-1);
+		break;
+	case 0xE0:
+		DBG2(RETAILMSG(1, (TEXT("E0 %x %x %x"),p[1],p[2],p[3]));)
+		if (pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount != (p[1]*256 + p[2]))
+		{
+			pForyouDVDInfo->sForyouDVDInfo.pNowReturnPlayingFileCount = p[1]*256 + p[2];
+			if (pForyouDVDInfo->sForyouDVDInfo.pBGetFileFolderFinish)
+			{
+				procDVDInfoE0(pForyouDVDInfo);
+			}
+			else
+			{
+				pForyouDVDInfo->sForyouDVDInfo.bRecE0AndNeedProc = TRUE;
+				DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD Rec E0 But Haven't Rec File Or Folder Info")));)
+			}
+		}
+		break;
+	case 0xE5:
+		if (memcmp(pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion,&p[1],6))
+		{
+			memcpy(pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion,&p[1],6);
+
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[0] = 'Y';
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[1]
+				= (pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[0] >> 4)/10 + '0';
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[2]
+				= (pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[0] >> 4)%10 + '0';
+
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[3] = 'M';
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[4]
+				= (pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[0] & 0x0F)/10 + '0';
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[5]
+				= (pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[0] & 0x0F)%10 + '0';
+
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[6] = 'D';
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[7]
+				= pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[1]/10 + '0';
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersion[8]
+				= pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[1]%10 + '0';
+
+			pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDSoftwareVersionLength = 9;
+			eventInterSetEvent(pForyouDVDInfo,EVENT_GLOBAL_RETURN_DVD_VERSION_ID);
+		}
+		break;
+	case 0xE7:
+		pForyouDVDInfo->bEnterUpdateMode = TRUE;
+		break;
+	default:
+		DBG2(RETAILMSG(1, (TEXT("unHandle!")));)
+		break;
+	}
+}
+
+UINT selectFolderOrFileByLocalIndex(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,UINT inWhatFolder,UINT localIndex,BOOL bHaveFolderIndex)
+{
+	UINT isFolderCount = getSelectParentFolderFileCount(pForyouDVDInfo,inWhatFolder,TRUE);
+	UINT isFileCount = getSelectParentFolderFileCount(pForyouDVDInfo,inWhatFolder,FALSE);
+	DBG2(RETAILMSG(1, (TEXT("\r\nForyou List Sel In Folder%d FolderCount%d FileCount%d"),inWhatFolder,isFolderCount,isFileCount));)
+	if (0 == inWhatFolder)//当前在根目录
+	{
+		if (!bHaveFolderIndex)
+		{
+			localIndex = localIndex + isFolderCount;
+		}
+		DBG2(RETAILMSG(1, (TEXT(" root folder%d file%d sel%d"),isFolderCount,isFileCount,localIndex));)
+		if (localIndex < isFolderCount)//选择的是文件夹
+		{
+			inWhatFolder = 
+				getSelectParentFolderFileInfoBySubIndex(pForyouDVDInfo,inWhatFolder,TRUE,localIndex);
+			isFolderCount = getSelectParentFolderFileCount(pForyouDVDInfo,inWhatFolder,TRUE);
+			isFileCount = getSelectParentFolderFileCount(pForyouDVDInfo,inWhatFolder,FALSE);
+			returnDVDCurrentFolderInfo(pForyouDVDInfo,isFolderCount+1+isFileCount,isFolderCount+1,FALSE);
+		}
+		else if (localIndex < (isFolderCount + isFileCount))//选择的是文件
+		{
+			control_DVD_PlayFileByAbsCount(pForyouDVDInfo,
+				pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[getSelectParentFolderFileInfoBySubIndex(pForyouDVDInfo,inWhatFolder,FALSE,localIndex - isFolderCount)].parentFolderIndex,
+				getSelectParentFolderFileInfoBySubIndex(pForyouDVDInfo,inWhatFolder,FALSE,localIndex - isFolderCount));
+		}
+	}
+	else//当前不在根目录
+	{
+		if (!bHaveFolderIndex)
+		{
+			localIndex = localIndex + isFolderCount + 1;
+		}
+		DBG2(RETAILMSG(1, (TEXT(" not root folder%d file%d sel%d"),isFolderCount,isFileCount,localIndex));)
+		if (0 == localIndex)//选择上一级目录
+		{
+			inWhatFolder = 
+				pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[inWhatFolder].parentFolderIndex;
+			isFolderCount = getSelectParentFolderFileCount(pForyouDVDInfo,inWhatFolder,TRUE);
+			isFileCount = getSelectParentFolderFileCount(pForyouDVDInfo,inWhatFolder,FALSE);
+			if (0 == inWhatFolder)//当前在根目录
+			{
+				returnDVDCurrentFolderInfo(pForyouDVDInfo,isFolderCount+isFileCount,isFolderCount,TRUE);
+			}
+			else
+			{
+				returnDVDCurrentFolderInfo(pForyouDVDInfo,isFolderCount+1+isFileCount,isFolderCount+1,FALSE);
+			}
+		}
+		else
+		{
+			if ((localIndex - 1) < isFolderCount)//选择的是文件夹
+			{
+				inWhatFolder = 
+					getSelectParentFolderFileInfoBySubIndex(pForyouDVDInfo,inWhatFolder,TRUE,localIndex - 1);
+				isFolderCount = getSelectParentFolderFileCount(pForyouDVDInfo,inWhatFolder,TRUE);
+				isFileCount = getSelectParentFolderFileCount(pForyouDVDInfo,inWhatFolder,FALSE);
+				returnDVDCurrentFolderInfo(pForyouDVDInfo,isFolderCount+1+isFileCount,isFolderCount+1,FALSE);
+			}
+			else if ((localIndex - 1) < (isFolderCount + isFileCount))//选择的是文件
+			{
+				control_DVD_PlayFileByAbsCount(pForyouDVDInfo,
+					pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[getSelectParentFolderFileInfoBySubIndex(pForyouDVDInfo,inWhatFolder,FALSE,localIndex - 1 - isFolderCount)].parentFolderIndex,
+					getSelectParentFolderFileInfoBySubIndex(pForyouDVDInfo,inWhatFolder,FALSE,localIndex - 1 - isFolderCount));
+			}
+		}
+	}
+	return inWhatFolder;
+}
+
+static VOID WinCECommandProcessor(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE *buf,UINT len)
+{
+	DBG2(RETAILMSG(1, (TEXT(" WinCECommandProcessor OK!")));)
+
+	switch(buf[0])
+	{
+	case 0x01:
+		if (0x01 == buf[1])
+		{
+			pForyouDVDInfo->bPower = TRUE;
+			returnDVDDevicePowerMode(pForyouDVDInfo,TRUE);
+		}
+		else if (0x00 == buf[1])
+		{
+			pForyouDVDInfo->bPower = FALSE;
+			returnDVDDevicePowerMode(pForyouDVDInfo,FALSE);
+		}
+		break;
+	case 0x10:
+		pForyouDVDInfo->sForyouDVDInfo.bDVDRequestState = buf[1];
+		pForyouDVDInfo->sForyouDVDInfo.iDVDStateCheckTime = GetTickCount();
+
+		if (0x18 == buf[1])//Next
+		{
+			if (0x02 == pForyouDVDInfo->sForyouDVDInfo.MediaDiscType
+				&& pForyouDVDInfo->sForyouDVDInfo.PlayMode != 0x01
+				&& pForyouDVDInfo->sForyouDVDInfo.PlayMode != 0x30)//Clips碟片直接选取
+			{
+				if (pForyouDVDInfo->sForyouDVDInfo.pBGetFileFolderFinish)
+				{
+					pForyouDVDInfo->sForyouDVDInfo.bQuickJumpNext = TRUE;
+					pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextCount++;
+					if (0 == pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos)
+					{
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = pForyouDVDInfo->sForyouDVDInfo.CurrentChar + 1;
+					}
+					else
+					{
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos++;
+					}
+					if (pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos
+						>= pForyouDVDInfo->sForyouDVDInfo.TotalChar)
+					{
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = pForyouDVDInfo->sForyouDVDInfo.TotalChar;
+					}
+					returnDVDCurrentTitleTrack(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentTitle
+						,pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos);
+				}
+			}
+			else
+			{
+				control_DVD_IR_CMD(pForyouDVDInfo,0x18);
+			}
+			pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextTimer = GetTickCount();
+			RETAILMSG(1, (TEXT("\r\n>TT:%dTI:%dCT:%dCI:%d")
+				,pForyouDVDInfo->sForyouDVDInfo.TotalTitle
+				,pForyouDVDInfo->sForyouDVDInfo.TotalChar
+				,pForyouDVDInfo->sForyouDVDInfo.CurrentTitle
+				,pForyouDVDInfo->sForyouDVDInfo.CurrentChar));
+		}
+		else if (0x19 == buf[1])//Prev
+		{
+			if (0x02 == pForyouDVDInfo->sForyouDVDInfo.MediaDiscType
+				&& pForyouDVDInfo->sForyouDVDInfo.PlayMode != 0x01
+				&& pForyouDVDInfo->sForyouDVDInfo.PlayMode != 0x30)//Clips碟片直接选取
+			{
+				if (pForyouDVDInfo->sForyouDVDInfo.pBGetFileFolderFinish)
+				{
+					pForyouDVDInfo->sForyouDVDInfo.bQuickJumpNext = FALSE;
+					pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextCount++;
+					if (0 == pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos)
+					{
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = pForyouDVDInfo->sForyouDVDInfo.CurrentChar - 1;
+					}
+					else
+					{
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos--;
+					}				
+					if (0 == pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos)
+					{
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = 1;
+					}
+					returnDVDCurrentTitleTrack(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentTitle
+						,pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos);
+				}
+			}
+			else
+			{
+				control_DVD_IR_CMD(pForyouDVDInfo,0x19);
+			}
+			pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextTimer = GetTickCount();
+			RETAILMSG(1, (TEXT("\r\n<TT:%dTI:%dCT:%dCI:%d")
+				,pForyouDVDInfo->sForyouDVDInfo.TotalTitle
+				,pForyouDVDInfo->sForyouDVDInfo.TotalChar
+				,pForyouDVDInfo->sForyouDVDInfo.CurrentTitle
+				,pForyouDVDInfo->sForyouDVDInfo.CurrentChar));
+		}
+		else
+		{
+			control_DVD_IR_CMD(pForyouDVDInfo,buf[1]);
+		}
+		break;
+	//case 0x11:
+	//	if (0x00 == buf[1])
+	//	{
+	//		control_DVD_IR_CMD(pForyouDVDInfo,0x62);
+	//	} 
+	//	else if (0x01 == buf[1])
+	//	{
+	//		control_DVD_IR_CMD(pForyouDVDInfo,0x64);
+	//	}
+	//	else if (0x02 == buf[1])
+	//	{
+	//		control_DVD_IR_CMD(pForyouDVDInfo,0x65);
+	//	}
+	//	else if (0x03 == buf[1])
+	//	{
+	//		control_DVD_IR_CMD(pForyouDVDInfo,0x63);
+	//	}
+	//	break;
+	case 0x12://为了不引起混乱，只有接口处把根目录计算在数量内
+		pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder
+			= selectFolderOrFileByLocalIndex(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder,(UINT)(buf[1]*256 + buf[2]),TRUE);
+		break;
+	case 0x13://为了不引起混乱，只有接口处把根目录计算在数量内
+		if (0 == pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder)//当前在根目录
+		{
+			pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart = (UINT)(buf[2]*256 + buf[3]);
+			pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount = buf[1];
+		}
+		else
+		{
+			if (0 == (UINT)(buf[2]*256 + buf[3]))//从上一级目录开始
+			{
+				if (buf[1])
+				{
+					BYTE nameFolder[] = {0,0};
+					returnDVDFileFolderInfo(pForyouDVDInfo,TRUE,nameFolder,2,0,0);//上一级目录
+					pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart = (UINT)(buf[2]*256 + buf[3]);
+					pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount = buf[1] - 1;
+				}
+				else
+				{
+					pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart = (UINT)(buf[2]*256 + buf[3]);
+					pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount = 0;
+				}
+			}
+			else
+			{
+				pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart = (UINT)(buf[2]*256 + buf[3] - 1);
+				pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount = buf[1];
+			}
+		}
+		pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount = 0;
+		SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDEvent);
+		break;
+	case 0x15:
+		if (0x00 == buf[1] || 0x01 == buf[1] || 0x02 == buf[1])
+		{
+			pForyouDVDInfo->sForyouDVDInfo.preVideoAspect = buf[1];
+			SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDEvent);
+		}
+		break;
+	case 0xFF:
+		if (0x01 == buf[1])
+		{
+			FCD_PowerUp((DWORD)pForyouDVDInfo);
+		} 
+		else if (0x00 == buf[1])
+		{
+			FCD_PowerDown((DWORD)pForyouDVDInfo);
+		}
+		break;
+	default:
+		DBG2(RETAILMSG(1, (TEXT(" Unhandle WinCE Command!")));)
+		break;
+	}
+}
+
+BYTE DVDReqStepChangeAndReq(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BYTE DVDReqStep)
+{
+	UINT i,j;
+	BOOL bCheck = FALSE;
+	do 
+	{
+		if (pForyouDVDInfo->sForyouDVDInfo.pBFolderFileListFolderErrorCheck)//文件夹接收检测
+		{
+			for (i = 0;i < pForyouDVDInfo->sForyouDVDInfo.pFolderCount;i++)
+			{
+				if (!pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[i].bStorage)
+				{
+					j = i+1;
+					while (j < pForyouDVDInfo->sForyouDVDInfo.pFolderCount &&
+						(!pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[j].bStorage))
+					{
+						j++;
+					}
+					control_DVD_ReqFileFolderDetailedInfo(pForyouDVDInfo,FALSE,i,j-i);
+					DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+					DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio FolderList has error!Start:%d,Count:%d"),i,j-i));)
+					return DVDReqStep;
+				}
+			}
+			if (i == pForyouDVDInfo->sForyouDVDInfo.pFolderCount)
+			{
+				DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio FolderList check OK!")));)
+				pForyouDVDInfo->sForyouDVDInfo.pBFolderFileListFolderErrorCheck = FALSE;
+				pForyouDVDInfo->sForyouDVDInfo.pBGetFolderFinish = TRUE;
+			}
+		}
+		if (pForyouDVDInfo->sForyouDVDInfo.pBFolderFileListFileErrorCheck)//文件接收检测
+		{
+			for (i = 0;i < pForyouDVDInfo->sForyouDVDInfo.pFileCount;i++)
+			{
+				if (!pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[i].bStorage)
+				{
+					j = i+1;
+					while (j < pForyouDVDInfo->sForyouDVDInfo.pFileCount &&
+						(!pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[j].bStorage))
+					{
+						j++;
+					}
+					control_DVD_ReqFileFolderDetailedInfo(pForyouDVDInfo,TRUE,i,j-i);
+					DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+						DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio FileList has error!Start:%d,Count:%d"),i,j-i));)
+						return DVDReqStep;
+				}
+			}
+			if (i == pForyouDVDInfo->sForyouDVDInfo.pFileCount)
+			{
+				DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio FileList check OK!")));)
+				pForyouDVDInfo->sForyouDVDInfo.pBFolderFileListFileErrorCheck = FALSE;
+				pForyouDVDInfo->sForyouDVDInfo.pBGetFileFinish = TRUE;
+			}
+		}
+		if (pForyouDVDInfo->sForyouDVDInfo.pBGetFolderFinish && pForyouDVDInfo->sForyouDVDInfo.pBGetFileFinish)
+		{
+			if (FALSE == pForyouDVDInfo->sForyouDVDInfo.pBGetFileFolderFinish)
+			{
+				DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio FolderFileList Start Return!")));)
+					pForyouDVDInfo->sForyouDVDInfo.pBGetFileFolderFinish = TRUE;
+				UINT isFolderCount = getSelectParentFolderFileCount(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder,TRUE);
+				UINT isFileCount = getSelectParentFolderFileCount(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder,FALSE);
+				returnDVDCurrentFolderInfo(pForyouDVDInfo,isFolderCount+isFileCount,isFolderCount,TRUE);
+
+				if (pForyouDVDInfo->sForyouDVDInfo.bRecE0AndNeedProc)
+				{
+					procDVDInfoE0(pForyouDVDInfo);
+				}
+	
+				pForyouDVDInfo->sForyouDVDInfo.bNeedSend8CTime = GetTickCount();
+			}
+		}
+
+		if (0 == DVDReqStep)//查播放设备
+		{
+			DVDReqStep = 2;
+			//control_DVD_ReqMechanismState(pForyouDVDInfo,0x03);
+			//DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+			//return DVDReqStep;
+		}
+		//if (1 == DVDReqStep)//查播放设备状态
+		//{
+		//	DVDReqStep = 2;
+		//	if (pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice <= 2)
+		//	{
+		//		control_DVD_ReqMechanismState(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice);
+		//		DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+		//		return DVDReqStep;
+		//	}
+		//	else if (0xFF == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismDevice)
+		//	{
+		//		control_DVD_ReqMechanismState(pForyouDVDInfo,0);
+		//		DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+		//		return DVDReqStep;
+		//	}
+		//}
+		if (2 == DVDReqStep)
+		{
+			DVDReqStep = 3;
+			if (0x09 == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[3])
+			{
+				control_DVD_ReqMediaState(pForyouDVDInfo);
+				DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+				return DVDReqStep;
+			}
+		}
+		if (3 == DVDReqStep)
+		{
+			DVDReqStep = 4;
+			if (pForyouDVDInfo->sForyouDVDInfo.pBGetFileFolderFinish)
+			{
+				control_DVD_ReqHighLightFileIndex(pForyouDVDInfo);
+				DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+				return DVDReqStep;
+			}
+		}
+		if (4 == DVDReqStep)
+		{
+			DVDReqStep =5;
+			if (0xFF == pForyouDVDInfo->sForyouDVDInfo.iDVDReturnRegionCode)
+			{
+				control_DVD_ReqRegionCode(pForyouDVDInfo);
+				DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+				return DVDReqStep;
+			}
+		}
+		if (5 == DVDReqStep)//确保碟机开启自动发送
+		{
+			DVDReqStep = 6;
+			if (GetTickCount() - pForyouDVDInfo->sForyouDVDInfo.bDeviceRec89 > 3000)
+			{
+				pForyouDVDInfo->sForyouDVDInfo.bDeviceRec89 = GetTickCount();
+				control_DVD_PlayBack_DisplayInfo_State_Request(pForyouDVDInfo,TRUE);
+				DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+				return DVDReqStep;
+			}
+		}
+		if (6 == DVDReqStep)//查询碟机程序版本号，确保有一个放在最后一直发送
+		{
+			DVDReqStep = 0;
+			//if (0x00 == pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[0])
+			//{
+				control_DVD_ReqDVDSoftwareVersion(pForyouDVDInfo);
+				DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+				return DVDReqStep;
+			//}
+		}
+		//if (7 == DVDReqStep)//循环查询各个设备状态，确保有一个放在最后一直发送
+		//{
+		//	DVDReqStep = 0;
+		//	pForyouDVDInfo->sForyouDVDInfo.CurrentReqMechanismCircle++;
+		//	pForyouDVDInfo->sForyouDVDInfo.CurrentReqMechanismCircle %= 2;
+		//	control_DVD_ReqMechanismState(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.CurrentReqMechanismCircle);
+		//	DBG2(RETAILMSG(1, (TEXT("<%d>"),DVDReqStep));)
+		//	return DVDReqStep;
+		//}		
+		if (bCheck)//大意是重新检查一次
+		{
+			bCheck = FALSE;
+		} 
+		else
+		{
+			bCheck = TRUE;
+		}
+	} while (bCheck);
+	DVDReqStep = 0;
+	return DVDReqStep;
+}
+static DWORD WINAPI ThreadFlyForyouDVDLECControlProc(LPVOID pContext)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)pContext;
+	ULONG WaitReturn;
+
+	while (!pForyouDVDInfo->bKillDispatchForyouDVDLEDControlThread)
+	{
+		WaitReturn = WaitForSingleObject(pForyouDVDInfo->hDispatchThreadForyouDVDLEDControlEvent, INFINITE);
+		if (pForyouDVDInfo->sForyouDVDInfo.LEDFlash)
+		{
+			DVD_LEDControl_On(pForyouDVDInfo);Sleep(365);DVD_LEDControl_Off(pForyouDVDInfo);Sleep(365);
+			DVD_LEDControl_On(pForyouDVDInfo);Sleep(365);DVD_LEDControl_Off(pForyouDVDInfo);Sleep(365);
+			DVD_LEDControl_On(pForyouDVDInfo);Sleep(365);DVD_LEDControl_Off(pForyouDVDInfo);Sleep(365);
+			DVD_LEDControl_On(pForyouDVDInfo);Sleep(365);DVD_LEDControl_Off(pForyouDVDInfo);Sleep(365);
+		}
+	}
+	pForyouDVDInfo->hThreadHandleFlyForyouDVDLEDControl = NULL;
+	DBG1(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyForyouDVDProcLEDControl exit")));)
+	return 0;
+}
+
+static void procDVDStop(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bForceSend)
+{
+	if (bForceSend || GetTickCount() - pForyouDVDInfo->sForyouDVDInfo.iDVDStateCheckTime >= 3000)//一定要控到STOP
+	{
+		pForyouDVDInfo->sForyouDVDInfo.iDVDStateCheckTime = GetTickCount();
+		if (0x17 == pForyouDVDInfo->sForyouDVDInfo.bDVDRequestState
+			&& 0x00 != pForyouDVDInfo->sForyouDVDInfo.bDVDResponseState)
+		{
+			RETAILMSG(1, (TEXT("\r\nForyou Force DVD State")));
+			control_DVD_IR_CMD(pForyouDVDInfo,0x17);
+		}
+	}
+}
+static void processForyouDVD(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,ULONG WaitReturn)
+{
+	if (pForyouDVDInfo->hDVDComm && pForyouDVDInfo->hDVDComm != INVALID_HANDLE_VALUE)//串口OK
+	{
+		if (pForyouDVDInfo->bPower)
+		{
+			if (!pForyouDVDInfo->bPowerUp)
+			{
+				pForyouDVDInfo->bPowerUp = TRUE;
+				DVD_LEDControl_Off(pForyouDVDInfo);
+#if FORYOU_DVD_RESET_FLYER
+				pForyouDVDInfo->sForyouDVDInfo.MechanismInitialize = TRUE;
+				returnDVDDeviceWorkMode(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.MechanismInitialize);
+				control_DVD_PlayBack_DisplayInfo_State_Request(pForyouDVDInfo,TRUE);
+				if (0xFF != pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[0])
+				{
+					returnDVDDeviceActionState(pForyouDVDInfo,0,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[0]);
+				}
+				control_DVD_ReqMechanismState(pForyouDVDInfo,0);
+#else
+				if (!pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bStandbyStatus)
+				{
+					DVD_Reset_On(pForyouDVDInfo);
+					Sleep(100);
+					DVD_Reset_Off(pForyouDVDInfo);
+				}
+#endif
+			}
+		}
+
+		if (pForyouDVDInfo->sForyouDVDInfo.MechanismInitialize)
+		{
+#if FORYOU_DVD_BUG_FIX
+			if (pForyouDVDInfo->sForyouDVDInfo.bNeedReturnNoDiscAfterClose)
+			{
+				if (GetTickCount() - pForyouDVDInfo->sForyouDVDInfo.iNeedReturnNoDiscAfterCloseTime >= 618*5)
+				{
+					pForyouDVDInfo->sForyouDVDInfo.bNeedReturnNoDiscAfterClose = FALSE;
+					if (0x03 == pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[0])
+					{
+						pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[0] = 0x00;
+						returnDVDDeviceActionState(pForyouDVDInfo,0,pForyouDVDInfo->sForyouDVDInfo.CurrentMechanismStatus[0]);
+					}
+				}
+			}
+#endif
+			DBG1(RETAILMSG(1, (TEXT("\r\nFlyAudio processForyouDVD-> procDVDStop LDH:")));)
+			procDVDStop(pForyouDVDInfo,FALSE);
+
+			if (pForyouDVDInfo->sForyouDVDInfo.bNeedSend8CTime)//CD-Text
+			{
+				if (GetTickCount() - pForyouDVDInfo->sForyouDVDInfo.bNeedSend8CTime >= 100)
+				{
+					pForyouDVDInfo->sForyouDVDInfo.bNeedSend8CTime = 0;
+					if (
+						((pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[0] << 8) + pForyouDVDInfo->sForyouDVDInfo.iSoftwareVersion[1])
+						>= ((((11 << 4) + 11) << 8) + 11)
+						)//确定版本号，11.11.11之后的都要有
+					{
+						if (0x03 == pForyouDVDInfo->sForyouDVDInfo.MediaFileType)//CDDA
+						{
+							control_DVD_ID3CDText(pForyouDVDInfo,0x51,1,pForyouDVDInfo->sForyouDVDInfo.pFileCount);
+						}
+					}
+				}
+			}
+			if (eventInterWhatEventOn(pForyouDVDInfo,EVENT_GLOBAL_DVD_REGION_SET_ID))
+			{
+				eventInterClrEvent(pForyouDVDInfo,EVENT_GLOBAL_DVD_REGION_SET_ID);
+				control_DVD_ControlRegionCode(pForyouDVDInfo,pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iDVDRegionCode);
+				pForyouDVDInfo->sForyouDVDInfo.iDVDReturnRegionCode = 0xFF;//重新查询
+			}
+
+
+			if (pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos)
+			{
+				RETAILMSG(1, (TEXT("\r\nForyou Have Jump")));
+				if (GetTickCount() - pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextTimer >= 618)
+				{
+					RETAILMSG(1, (TEXT("\r\nForyou Have Jump On Time")));
+					if (0x02 == pForyouDVDInfo->sForyouDVDInfo.MediaDiscType)//Clips
+					{
+						if (1 == pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextCount)
+						{
+							if (pForyouDVDInfo->sForyouDVDInfo.bQuickJumpNext)
+							{
+								control_DVD_IR_CMD(pForyouDVDInfo,0x18);
+							}
+							else
+							{
+								control_DVD_IR_CMD(pForyouDVDInfo,0x19);
+							}
+						}
+						else
+						{
+							selectFolderOrFileByLocalIndex(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.pNowPlayingInWhatFolder,pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos-1,FALSE);
+						}
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextCount = 0;
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = 0;
+					}
+					else if (pForyouDVDInfo->sForyouDVDInfo.bQuickJumpNext)
+					{
+						RETAILMSG(1, (TEXT("\r\nForyou Have Jump Next %d"),pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos));
+						if (1 == pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos)
+						{
+							control_DVD_IR_CMD(pForyouDVDInfo,0x18);
+						}
+						else
+						{
+							control_DVD_JumpNextN(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos);
+						}
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextCount = 0;
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = 0;
+					}
+					else
+					{
+						RETAILMSG(1, (TEXT("\r\nForyou Have Jump Prev %d"),pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos));
+						if (1 == pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos)
+						{
+							control_DVD_IR_CMD(pForyouDVDInfo,0x19);
+						}
+						else
+						{
+							control_DVD_JumpPrevN(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos);
+						}
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpNextCount = 0;
+						pForyouDVDInfo->sForyouDVDInfo.iQuickJumpTitlePos = 0;
+					}
+				}
+			}
+
+			if (pForyouDVDInfo->sForyouDVDInfo.curVideoAspect !=pForyouDVDInfo->sForyouDVDInfo.preVideoAspect)
+			{
+				//视频比例切换
+				pForyouDVDInfo->sForyouDVDInfo.curVideoAspect = pForyouDVDInfo->sForyouDVDInfo.preVideoAspect;
+
+				control_DVD_IR_CMD(pForyouDVDInfo,0x17);
+				Sleep(100);
+				if (0x00 == pForyouDVDInfo->sForyouDVDInfo.curVideoAspect)
+				{
+					control_DVD_Set_View_Mode(pForyouDVDInfo,0x04);
+					Sleep(1000);
+					control_DVD_Video_Aspect_Radio(pForyouDVDInfo,0x01);
+					Sleep(1000);
+				}
+				else if (0x01 == pForyouDVDInfo->sForyouDVDInfo.curVideoAspect)
+				{
+					control_DVD_Set_View_Mode(pForyouDVDInfo,0x04);
+					Sleep(1000);
+					control_DVD_Video_Aspect_Radio(pForyouDVDInfo,0x00);
+					Sleep(1000);
+				}
+				else if (0x02 == pForyouDVDInfo->sForyouDVDInfo.curVideoAspect)
+				{
+					control_DVD_Set_View_Mode(pForyouDVDInfo,0x00);
+					Sleep(1000);
+					//control_DVD_Video_Aspect_Radio(pForyouDVDInfo,0x01);
+					//Sleep(1000);
+				}
+
+				control_DVD_IR_CMD(pForyouDVDInfo,0x14);
+			}
+
+			if (pForyouDVDInfo->sForyouDVDInfo.pBGetFileFolderFinish)//已完成接收
+			{
+				if (pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount != pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount)//需要返回
+				{
+					UINT isFolderCount = getSelectParentFolderFileCount(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder,TRUE);
+					UINT isFileCount = getSelectParentFolderFileCount(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder,FALSE);
+					UINT isWhere;
+					DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyForyouDVDProc Need Return In:%d TotalFolder:%d TotalFile:%d"),pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder,isFolderCount,isFileCount));)
+						while (pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount != pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount)//需要返回
+						{
+							DBG2(RETAILMSG(1, (TEXT(" More")));)
+								if ((pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart + pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount) < isFolderCount)//返回文件夹
+								{
+									isWhere = getSelectParentFolderFileInfoBySubIndex(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder,TRUE
+										,pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart + pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount);
+									DBG2(RETAILMSG(1, (TEXT(" Folder:%d"),isWhere));)
+										if (-1 != isWhere)
+										{
+											if (0 == pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder)//当前是根目录
+											{
+												returnDVDFileFolderInfo(pForyouDVDInfo,TRUE
+													,pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[isWhere].name
+													,pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[isWhere].nameLength
+													,pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart + pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount
+													,isWhere);
+											}
+											else
+											{
+												returnDVDFileFolderInfo(pForyouDVDInfo,TRUE
+													,pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[isWhere].name
+													,pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList[isWhere].nameLength
+													,pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart + pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount + 1
+													,isWhere);
+											}
+											pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount++;
+										}
+										else
+										{
+											pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount = pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount;
+										}
+								}
+								else if ((pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart + pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount) < (isFolderCount + isFileCount))//返回文件
+								{
+									isWhere = getSelectParentFolderFileInfoBySubIndex(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder,FALSE
+										,pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart + pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount - isFolderCount);
+									DBG2(RETAILMSG(1, (TEXT(" File:%d"),isWhere));)
+										if (-1 != isWhere)
+										{
+											if (0 == pForyouDVDInfo->sForyouDVDInfo.pNowInWhatFolder)//当前是根目录
+											{
+												returnDVDFileFolderInfo(pForyouDVDInfo,FALSE
+													,pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[isWhere].name
+													,pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[isWhere].nameLength
+													,pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart + pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount
+													,isWhere);
+											}
+											else
+											{
+												returnDVDFileFolderInfo(pForyouDVDInfo,FALSE
+													,pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[isWhere].name
+													,pForyouDVDInfo->sForyouDVDInfo.pFileTreeList[isWhere].nameLength
+													,pForyouDVDInfo->sForyouDVDInfo.pNeedReturnStart + pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount + 1
+													,isWhere);
+											}
+											pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount++;
+										}
+										else
+										{
+											pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount = pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount;
+										}
+								}
+								else
+								{
+									pForyouDVDInfo->sForyouDVDInfo.pNowReturnCount = pForyouDVDInfo->sForyouDVDInfo.pNeedReturnCount;
+								}
+						}
+				}
+			}
+
+			if (pForyouDVDInfo->sForyouDVDInfo.pBStartGetFolderFile)
+			{
+				if (0 == pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount)//控制状态跳转
+				{
+					if (pForyouDVDInfo->sForyouDVDInfo.pReturnE8)
+					{
+						if (pForyouDVDInfo->sForyouDVDInfo.pFolderCount)
+						{
+							pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount = 1;
+						} 
+						else if (pForyouDVDInfo->sForyouDVDInfo.pFileCount)
+						{
+							pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount = 2;
+						}
+						else
+						{
+							pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount = 3;
+						}
+					}
+				}
+				else if (1 == pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount)
+				{
+					if (pForyouDVDInfo->sForyouDVDInfo.pReturnEAFolder)
+					{
+						if (pForyouDVDInfo->sForyouDVDInfo.pFileCount)
+						{
+							pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount = 2;
+						}
+						else
+						{
+							pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount = 3;
+						}
+					}
+				}
+				else if (2 == pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount)
+				{
+					if (pForyouDVDInfo->sForyouDVDInfo.pReturnEAFile)
+					{
+						pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount = 3;
+					}
+				}
+
+				if (0 == pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount)//执行状态操作
+				{
+					if (WAIT_TIMEOUT == WaitReturn || pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow)
+					{
+						control_DVD_ReqFileFolderCount(pForyouDVDInfo);
+					}
+				}
+				else if (1 == pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount)
+				{
+					if (WAIT_TIMEOUT == WaitReturn || pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow)
+					{
+						control_DVD_ReqFileFolderDetailedInfo(pForyouDVDInfo,0,0,pForyouDVDInfo->sForyouDVDInfo.pFolderCount);
+					}				
+				}
+				else if (2 == pForyouDVDInfo->sForyouDVDInfo.pStartGetFolderFileCount)
+				{
+					if (WAIT_TIMEOUT == WaitReturn || pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow)
+					{
+						control_DVD_ReqFileFolderDetailedInfo(pForyouDVDInfo,1,0,pForyouDVDInfo->sForyouDVDInfo.pFileCount);
+					}
+				}
+				else
+				{
+					DBG2(RETAILMSG(1, (TEXT("\r\nForyouDVD End get folder and file list")));)
+					pForyouDVDInfo->sForyouDVDInfo.pBStartGetFolderFile = FALSE;
+					pForyouDVDInfo->sForyouDVDInfo.pBFolderFileListFolderErrorCheck = TRUE;
+					pForyouDVDInfo->sForyouDVDInfo.pBFolderFileListFileErrorCheck = TRUE;
+				}
+
+				pForyouDVDInfo->sForyouDVDInfo.pBReqFolderFileCommandActiveNow = FALSE;
+			}
+			else if (WAIT_TIMEOUT == WaitReturn || pForyouDVDInfo->sForyouDVDInfo.bForceExecReqStep)//如果超时退出
+			{
+				pForyouDVDInfo->sForyouDVDInfo.bForceExecReqStep = FALSE;
+				pForyouDVDInfo->sForyouDVDInfo.DVDReqStep = DVDReqStepChangeAndReq(pForyouDVDInfo,pForyouDVDInfo->sForyouDVDInfo.DVDReqStep);
+			}
+			else
+			{
+
+			}
+		}
+	}
+}
+
+static DWORD WINAPI ThreadFlyForyouDVDProc(LPVOID pContext)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)pContext;
+	ULONG WaitReturn;
+
+	while (!pForyouDVDInfo->bKillDispatchForyouDVDThread)
+	{
+		if (pForyouDVDInfo->sForyouDVDInfo.pBStartGetFolderFile)
+		{
+			WaitReturn = WaitForSingleObject(pForyouDVDInfo->hDispatchThreadForyouDVDEvent, 618*5);
+		}
+		else
+		{
+			WaitReturn = WaitForSingleObject(pForyouDVDInfo->hDispatchThreadForyouDVDEvent, 618);
+		}
+		DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyForyouDVDProc %d"),WaitReturn));)
+
+		if (pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bSilencePowerUp)
+		{
+			DVD_Reset_On(pForyouDVDInfo);
+			continue;
+		}
+
+		if (!pForyouDVDInfo->bEnterUpdateMode
+			&& pForyouDVDInfo->bAutoResetControlOn
+			&& !pForyouDVDInfo->bFlyaudioDVD)//碟机死机的复位
+		{
+			if (GetTickCount() - pForyouDVDInfo->iAutoResetControlTime >= 150*1000)
+			{
+				DVD_Reset_On(pForyouDVDInfo);
+				Sleep(100);
+				DVD_Reset_Off(pForyouDVDInfo);
+			}
+		}
+
+		if (eventInterWhatEventOn(pForyouDVDInfo,EVENT_GLOBAL_STANDBY_DVD_ID))
+		{
+			eventInterClrEvent(pForyouDVDInfo,EVENT_GLOBAL_STANDBY_DVD_ID);
+			if (pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bStandbyStatus)
+			{
+				Sleep(314);
+				DVD_Reset_On(pForyouDVDInfo);
+			}
+			else
+			{
+				DVD_Reset_On(pForyouDVDInfo);
+				Sleep(100);
+				DVD_Reset_Off(pForyouDVDInfo);
+			}
+		}
+
+		if (pForyouDVDInfo->bFlyaudioDVD)
+		{
+			processFlyaudioDVD(pForyouDVDInfo,WaitReturn);
+		}
+		else
+		{
+			processForyouDVD(pForyouDVDInfo,WaitReturn);
+		}
+	}
+	while (pForyouDVDInfo->hThreadHandleFlyForyouDVDLEDControl)
+	{
+		SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDLEDControlEvent);
+		Sleep(10);
+	}
+	CloseHandle(pForyouDVDInfo->hDispatchThreadForyouDVDLEDControlEvent);
+
+	CloseHandle(pForyouDVDInfo->hDispatchThreadForyouDVDEvent);
+	DBG1(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyForyouDVDProc exit")));)
+	return 0;
+}
+
+void ForyouDVD_Enable(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bEnable)
+{
+	DWORD dwThreadID;
+	if (bEnable)
+	{
+#if FORYOU_DVD_RESET_FLYER
+		DVD_Reset_Off(pForyouDVDInfo);
+#else
+		DVD_Reset_On(pForyouDVDInfo);
+#endif
+		DVD_LEDControl_Off(pForyouDVDInfo);
+
+		pForyouDVDInfo->bKillDispatchForyouDVDLEDControlThread = FALSE;
+		pForyouDVDInfo->hDispatchThreadForyouDVDLEDControlEvent = CreateEvent(NULL, FALSE, TRUE, NULL);	
+		pForyouDVDInfo->hThreadHandleFlyForyouDVDLEDControl = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadFlyForyouDVDLECControlProc, //线程的全局函数
+			pForyouDVDInfo, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyForyouDVDLEDControlProc ID:%x"),dwThreadID));)
+
+		if (NULL == pForyouDVDInfo->hThreadHandleFlyForyouDVDLEDControl)
+		{
+			pForyouDVDInfo->bKillDispatchForyouDVDLEDControlThread = TRUE;
+			return;
+		}
+
+		pForyouDVDInfo->bKillDispatchForyouDVDThread = FALSE;
+		pForyouDVDInfo->hDispatchThreadForyouDVDEvent = CreateEvent(NULL, FALSE, TRUE, DATA_GLOBAL_HANDLE_DVD);	
+		pForyouDVDInfo->hThreadHandleFlyForyouDVD = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadFlyForyouDVDProc, //线程的全局函数
+			pForyouDVDInfo, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio ThreadFlyForyouDVDProc ID:%x"),dwThreadID));)
+
+		if (NULL == pForyouDVDInfo->hThreadHandleFlyForyouDVD)
+		{
+			pForyouDVDInfo->bKillDispatchForyouDVDThread = TRUE;
+			return;
+		}
+
+		openDVDComm(pForyouDVDInfo);
+		structDVDInfoInit(pForyouDVDInfo,TRUE);
+	}
+	else
+	{
+		pForyouDVDInfo->bKillDispatchForyouDVDThread = TRUE;
+		SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDEvent);
+
+		pForyouDVDInfo->bKillDispatchForyouDVDLEDControlThread = TRUE;
+		SetEvent(pForyouDVDInfo->hDispatchThreadForyouDVDLEDControlEvent);
+
+		closeDVDComm(pForyouDVDInfo);
+	}
+}
+
+static void powerNormalDeInit(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	pForyouDVDInfo->buffToUserHx = 0;
+	pForyouDVDInfo->buffToUserLx = 0;
+
+	pForyouDVDInfo->DVDInfoFrameStatus = 0;
+	pForyouDVDInfo->DVDInfoFrameLengthMax = 0;
+	pForyouDVDInfo->DVDInfoFrameLength = 0;
+	pForyouDVDInfo->DVDInfoFrameChecksum = 0;
+	pForyouDVDInfo->DVDInfoFrameCRCErrorTailLength = 0;
+	pForyouDVDInfo->bPower = FALSE;
+	pForyouDVDInfo->bPowerUp = FALSE;
+}
+
+static void powerNormalInit(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	pForyouDVDInfo->buffToUserHx = 0;
+	pForyouDVDInfo->buffToUserLx = 0;
+
+	pForyouDVDInfo->DVDInfoFrameStatus = 0;
+	pForyouDVDInfo->DVDInfoFrameLengthMax = 0;
+	pForyouDVDInfo->DVDInfoFrameLength = 0;
+	pForyouDVDInfo->DVDInfoFrameChecksum = 0;
+}
+
+static void powerOnFirstInit(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo)
+{
+	pForyouDVDInfo->bOpen = FALSE;
+	pForyouDVDInfo->bPower = FALSE;
+	pForyouDVDInfo->bPowerUp = FALSE;
+	pForyouDVDInfo->bSpecialPower = FALSE;
+
+	pForyouDVDInfo->bEnterUpdateMode = FALSE;
+
+	pForyouDVDInfo->bKillDispatchForyouDVDThread = TRUE;
+	pForyouDVDInfo->hThreadHandleFlyForyouDVD = NULL;
+	pForyouDVDInfo->hDispatchThreadForyouDVDEvent = NULL;
+
+	pForyouDVDInfo->bKillDispatchForyouDVDLEDControlThread = TRUE;
+	pForyouDVDInfo->hThreadHandleFlyForyouDVDLEDControl = NULL;
+	pForyouDVDInfo->hThreadHandleFlyForyouDVDLEDControl = NULL;
+
+	pForyouDVDInfo->hDVDComm = NULL;
+	pForyouDVDInfo->bKillFlyDVDCommThread = TRUE;
+	pForyouDVDInfo->hThreadHandleFlyDVDComm = NULL;
+
+#if FORYOU_DVD_RESET_FLYER
+	DVD_Reset_Off(pForyouDVDInfo);
+#else
+	DVD_Reset_On(pForyouDVDInfo);
+#endif
+	DVD_LEDControl_Off(pForyouDVDInfo);
+}
+
+static void powerOnSpecialEnable(P_FLY_FORYOU_DVD_INFO pForyouDVDInfo,BOOL bOn)
+{
+	if (bOn)
+	{
+		if (pForyouDVDInfo->bSpecialPower)
+		{
+			return;
+		}
+		pForyouDVDInfo->bSpecialPower = TRUE;
+
+		pForyouDVDInfo->hBuffToUserDataEvent = CreateEvent(NULL,FALSE,FALSE,NULL);	
+		InitializeCriticalSection(&pForyouDVDInfo->hCSSendToUser);
+
+		pForyouDVDInfo->sForyouDVDInfo.pFolderTreeList = NULL;//链表需要提前初始化
+		pForyouDVDInfo->sForyouDVDInfo.pFileTreeList = NULL;//链表需要提前初始化
+		structDVDInfoInit(pForyouDVDInfo,TRUE);
+
+#if FORYOU_DVD_RESET_FLYER
+		DVD_Reset_Off(pForyouDVDInfo);
+#else
+		DVD_Reset_On(pForyouDVDInfo);
+#endif
+		DVD_LEDControl_Off(pForyouDVDInfo);
+	}
+	else
+	{
+		if (!pForyouDVDInfo->bSpecialPower)
+		{
+			return;
+		}
+		pForyouDVDInfo->bSpecialPower = FALSE;
+
+		structDVDInfoInit(pForyouDVDInfo,TRUE);
+
+#if FORYOU_DVD_RESET_FLYER
+		DVD_Reset_Off(pForyouDVDInfo);
+#else
+		DVD_Reset_On(pForyouDVDInfo);
+#endif
+		DVD_LEDControl_Off(pForyouDVDInfo);
+
+		CloseHandle(pForyouDVDInfo->hBuffToUserDataEvent);
+	}
+}
+
+HANDLE
+FCD_Init(DWORD dwContext)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo;
+
+	RETAILMSG(1, (TEXT("\r\nForyou Init Start")));
+
+	// 加载驱动并取得函数指针数组的地址(存放了要引出的底层函数的指针)
+	pUDDApiTable = UDD_ConnectService();
+	if(SOC_Version_Check(SOC_DRV_VERSION) == FALSE)
+	{
+		RETAILMSG(1, (TEXT("\r\nFlyAudio Global ERR SOC_Version_Check!")));
+		// 错误处理
+	}
+	pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)LocalAlloc(LPTR, sizeof(FLY_FORYOU_DVD_INFO));
+	if (!pForyouDVDInfo)
+	{
+		return NULL;
+	}
+	//全局
+	pForyouDVDInfo->pFlyDriverGlobalInfo = SOC_DriverGlobal_Get();
+
+	if (pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalStructSize
+		!= sizeof(FLY_DRIVER_GLOBAL))
+	{
+		pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[0] = 'F';
+		pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[1] = 'C';
+		pForyouDVDInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[2] = 'D';
+	}
+
+	//参数初始化
+	powerNormalInit(pForyouDVDInfo);//电源正常初始化
+	powerOnFirstInit(pForyouDVDInfo);
+	powerOnSpecialEnable(pForyouDVDInfo,TRUE);
+
+
+	pForyouDVDInfo->hHandleGlobalGlobalEvent = CreateEvent(NULL,FALSE,FALSE,DATA_GLOBAL_HANDLE_GLOBAL);
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalDVDInfo.bInit = TRUE;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompYear = year;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompMon = months;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompDay = day;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompHour = hours;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompMin = minutes;
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompSec = seconds;
+
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD Init Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));)
+
+	return (HANDLE)pForyouDVDInfo;
+}
+
+BOOL
+FCD_Deinit(DWORD hDeviceContext)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)hDeviceContext;
+
+	//全局
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalDVDInfo.bInit = FALSE;
+	CloseHandle(pForyouDVDInfo->hHandleGlobalGlobalEvent);
+
+	powerOnSpecialEnable(pForyouDVDInfo,FALSE);
+
+	LocalFree(pForyouDVDInfo);
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD DeInit")));)
+	return TRUE;
+}
+
+DWORD
+FCD_Open(DWORD hDeviceContext, DWORD AccessCode, DWORD ShareMode)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)hDeviceContext;
+	DWORD returnWhat = hDeviceContext;
+
+	if (pForyouDVDInfo->bOpen)
+	{
+		return NULL;
+	}
+	pForyouDVDInfo->bOpen = TRUE;
+
+	ForyouDVD_Enable(pForyouDVDInfo,TRUE);
+
+	//全局
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalDVDInfo.bOpen = TRUE;
+
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD Open Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));)
+	return returnWhat;
+}
+
+BOOL
+FCD_Close(DWORD hDeviceContext)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)hDeviceContext;
+
+	pForyouDVDInfo->bOpen = FALSE;
+
+	ForyouDVD_Enable(pForyouDVDInfo,FALSE);
+
+	//全局
+	pForyouDVDInfo->pFlyDriverGlobalInfo->FlyGlobalDVDInfo.bOpen = FALSE;
+
+	SetEvent(pForyouDVDInfo->hBuffToUserDataEvent);
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD Close")));)
+	return TRUE;
+}
+
+VOID
+FCD_PowerUp(DWORD hDeviceContext)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)hDeviceContext;
+
+	powerNormalInit(pForyouDVDInfo);
+
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD PowerUp")));)
+}
+
+VOID
+FCD_PowerDown(DWORD hDeviceContext)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)hDeviceContext;
+
+	powerNormalDeInit(pForyouDVDInfo);
+
+	DBG0(RETAILMSG(1, (TEXT("\r\nForyouDVD PowerDown")));)
+}
+
+DWORD
+FCD_Read(DWORD hOpenContext, LPVOID pBuffer, DWORD Count)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)hOpenContext;
+
+	UINT dwRead = 0;
+	BYTE *SendBuf = (BYTE *)pBuffer;
+
+
+	while(dwRead < Count && pForyouDVDInfo->buffToUserLx != pForyouDVDInfo->buffToUserHx)
+	{
+		SendBuf[dwRead++] = pForyouDVDInfo->buffToUser[pForyouDVDInfo->buffToUserLx++];
+		if (pForyouDVDInfo->buffToUserLx >= DATA_BUFF_TOUSER_LENGTH)
+		{
+			pForyouDVDInfo->buffToUserLx = 0;
+		}
+	}
+	if(pForyouDVDInfo->buffToUserLx != pForyouDVDInfo->buffToUserHx)
+	{
+		SetEvent(pForyouDVDInfo->hBuffToUserDataEvent);
+	}
+	return dwRead;
+}
+
+DWORD
+FCD_Write(DWORD hOpenContext, LPCVOID pSourceBytes, DWORD NumberOfBytes)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)hOpenContext;
+	DBG1(RETAILMSG(1, (TEXT("\r\nForyouDVD Write %d "),
+					NumberOfBytes));)
+	for(UINT i = 0;i < NumberOfBytes;i++)
+	{
+		DBG1(RETAILMSG(1, (TEXT(" %X"),
+			*((BYTE *)pSourceBytes + i)));)
+	}
+	if(NumberOfBytes)
+	{
+		WinCECommandProcessor(pForyouDVDInfo,(((BYTE *)pSourceBytes)+3),((BYTE *)pSourceBytes)[2] - 1);
+	}
+	return NULL;
+}
+
+DWORD
+FCD_Seek(DWORD hOpenContext, LONG Amount, DWORD  Type)
+{
+	return NULL;
+}
+
+BOOL
+FCD_IOControl(DWORD hOpenContext,
+			  DWORD dwCode, PBYTE pBufIn, DWORD dwLenIn,
+			  PBYTE pBufOut, DWORD dwLenOut, PDWORD pdwActualOut)
+{
+	P_FLY_FORYOU_DVD_INFO pForyouDVDInfo = (P_FLY_FORYOU_DVD_INFO)hOpenContext;
+	BOOL bRes = TRUE;
+
+	if (dwCode != IOCTL_SERIAL_WAIT_ON_MASK)
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio Foryou IOControl(h:0x%X, Code:%X, IN:0x%X, %d, OUT:0x%X, %d, ActOut:0x%X)\r\n"),
+			hOpenContext, dwCode, pBufIn, dwLenIn, pBufOut, dwLenOut, pdwActualOut));)
+	}
+
+	switch (dwCode)
+	{
+	case IOCTL_SERIAL_SET_WAIT_MASK:
+		DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio Foryou IOControl Set IOCTL_SERIAL_SET_WAIT_MASK")));)
+		break;
+	case IOCTL_SERIAL_WAIT_ON_MASK:
+		//DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio Foryou IOControl Set IOCTL_SERIAL_WAIT_ON_MASK")));)
+		if (pForyouDVDInfo->bOpen)
+		{
+			WaitForSingleObject(pForyouDVDInfo->hBuffToUserDataEvent,INFINITE);
+		}
+		else
+		{
+			WaitForSingleObject(pForyouDVDInfo->hBuffToUserDataEvent,0);
+		}
+		if ((dwLenOut < sizeof(DWORD)) || (NULL == pBufOut) ||
+			(NULL == pdwActualOut))
+		{
+			bRes = FALSE;
+			break;
+		}
+		*(DWORD *)pBufOut = EV_RXCHAR;
+		*pdwActualOut = sizeof(DWORD);
+		break;
+	default :
+		break;
+	}
+
+	return bRes;
+}
+
+BOOL
+DllEntry(
+		 HINSTANCE hinstDll,
+		 DWORD dwReason,
+		 LPVOID lpReserved
+		 )
+{
+	if (dwReason == DLL_PROCESS_ATTACH)
+	{
+		DEBUGMSG(1, (TEXT("Attach in FlyAudio FouyouDVD DllEntry\n")));
+		DisableThreadLibraryCalls((HMODULE)hinstDll);
+	}
+
+	if (dwReason == DLL_PROCESS_DETACH)
+	{
+		DEBUGMSG(1, (TEXT("Dettach in FlyAudio FouyouDVD DllEntry\n")));
+	}
+
+	DEBUGMSG(1, (TEXT("Leaving FlyAudio FouyouDVD DllEntry\n")));
+
+	return (TRUE);
+}

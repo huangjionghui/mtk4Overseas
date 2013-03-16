@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY		FlyAC
+
+EXPORTS FAC_Init
+	FAC_Deinit
+	FAC_Open
+	FAC_Close
+	FAC_Read
+	FAC_Write
+	FAC_Seek
+	FAC_PowerDown
+	FAC_PowerUp
+	FAC_IOControl

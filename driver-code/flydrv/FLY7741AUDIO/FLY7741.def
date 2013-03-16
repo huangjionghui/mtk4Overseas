@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY SAF7741
+
+EXPORTS FAU_Init
+	FAU_Deinit
+	FAU_Open
+	FAU_Close
+	FAU_Read
+	FAU_Write
+	FAU_Seek
+	FAU_PowerDown
+	FAU_PowerUp
+	FAU_IOControl

@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FlyTV
+
+EXPORTS FTV_Init
+	FTV_Deinit
+	FTV_Open
+	FTV_Close
+	FTV_Read
+	FTV_Write
+	FTV_Seek
+	FTV_PowerDown
+	FTV_PowerUp
+	FTV_IOControl

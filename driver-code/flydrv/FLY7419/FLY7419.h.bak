@@ -1,0 +1,182 @@
+/************************************************************************/
+/* FLYAUDIO TDA7419                                                     */
+/************************************************************************/
+#pragma once
+
+#ifndef _FLYAUDIO_TDA7419_H_
+#define _FLYAUDIO_TDA7419_H_
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+#define GLOBAL_COMM	1
+
+#define FLY7419_ADDR_R				0x89
+#define FLY7419_ADDR_W				0x88
+
+//#define R2S11002_ADDR_R				0x91
+//#define R2S11002_ADDR_W				0x90
+//
+//#define STM32_ADDR_R				0xFB
+//#define STM32_ADDR_W				0xFA
+
+	//BYTE audioChannelGainTab[14]={//增益//0dB59,6dB65
+	//	59,59,59,59,59,59,59,59,59,59,59,59,59,59};
+#define BALANCE_LEVEL_COUNT		21
+#define FADER_LEVEL_COUNT		21
+
+#define TREB_FREQ_COUNT		2
+#define TREB_LEVEL_COUNT	11
+
+#define MID_FREQ_COUNT		3
+#define MID_LEVEL_COUNT		11
+
+#define BASS_FREQ_COUNT		2
+#define BASS_LEVEL_COUNT	11
+
+#define LOUDNESS_FREQ_COUNT		2
+#define LOUDNESS_LEVEL_COUNT	11
+
+#define SUB_FILTER_COUNT	3
+#define SUB_LEVEL_COUNT		11
+
+#define DATA_BUFF_LENGTH_TO_DRIVER	1024
+#define DATA_BUFF_LENGTH_TO_USER	1024
+
+	//BYTE EQ_Default[9] = {6,6,6,6,6,6,6,6,6};
+	//BYTE EQ_Classic[9] = {10,5,6,6,7,6,8,10,9};
+	//BYTE EQ_Pop[9] = {8,4,7,5,7,5,7,9,8};
+
+	typedef struct _FLY_AUDIO_INFO//添加变量后请在Fly7419AudioParaInitDefault函数初始化
+	{
+		BOOL bInit;
+		//	BOOL GraphicalSpectrumAnalyzer;
+		//	BYTE GraphicalSpectrumAnalyzerValue[9];
+
+		BOOL bMuteRadio;//收音机
+		BOOL bMuteBT;//BT
+
+		audio_source preMainAudioInput;
+		audio_source tmpMainAudioInput;
+		audio_source curMainAudioInput;
+		UINT preMainVolume;
+		UINT curMainVolume;
+		BOOL preMainMute;
+		BOOL tmpMainMute;//中转值
+		BOOL curMainMute;
+		UINT preBassFreq;
+		UINT curBassFreq;
+		UINT preBassLevel;
+		UINT curBassLevel;
+		UINT preMidFreq;
+		UINT curMidFreq;
+		UINT preMidLevel;
+		UINT curMidLevel;
+		UINT preTrebleFreq;
+		UINT curTrebleFreq;
+		UINT preTrebleLevel;
+		UINT curTrebleLevel;
+		UINT preLoudFreq;
+		UINT curLoudFreq;
+		UINT preLoudLevel;
+		UINT curLoudLevel;
+		UINT preBalance;
+		UINT curBalance;
+		UINT preFader;
+		UINT curFader;
+		BOOL preLoudnessOn;
+		BOOL curLoudnessOn;
+		BOOL preSubOn;
+		BOOL curSubOn;
+		UINT preSubFilter;
+		UINT curSubFilter;
+		UINT preSubLevel;
+		UINT curSubLevel;
+
+		BYTE preGPSSpeaker;
+		BYTE tmpGPSSpeaker;
+		BYTE curGPSSpeaker;
+
+		UINT preReadReg;
+		UINT curReadReg;
+		BOOL ReadRegFlag;
+
+	}FLY_AUDIO_INFO, *P_FLY_AUDIO_INFO;
+
+	typedef struct _FLY_TDA7419_INFO
+	{
+		BOOL bOpen;
+		BOOL bPowerUp;
+		BOOL bPowerSpecialUp;
+
+		BOOL bNeedInit;
+
+		BYTE buffToUser[DATA_BUFF_LENGTH_TO_USER];
+		UINT buffToUserHx;
+		UINT buffToUserLx;
+		HANDLE hBuffToUserDataEvent;
+		CRITICAL_SECTION hCSSendToUser;
+
+		BOOL bKillDispatchTda7419MainThread;
+		HANDLE	Tda7419MainThreadHandle;
+		HANDLE hDispatchTda7419MainThreadEvent;
+
+		BOOL bKillDispatchTda7419DelayThread;
+		HANDLE	Tda7419DelayThreadHandle;
+		HANDLE hDispatchTda7419DelayThreadEvent;
+
+		HANDLE	Tda7419I2CHandle;
+
+		FLY_AUDIO_INFO FlyAudioInfo;		 
+
+		HANDLE hHandleGlobalGlobalEvent;
+		PFLY_DRIVER_GLOBAL pFlyDriverGlobalInfo;
+	}FLY_TDA7419_INFO, *P_FLY_TDA7419_INFO;
+
+#define VALUE_UNKNOWN	0xFFFFFFFF
+
+#define B_FREQ_60		0
+#define B_FREQ_80		1
+#define B_FREQ_100		2
+#define B_FREQ_200		3
+
+#define M_FREQ_500     0
+#define M_FREQ_1000    1
+#define M_FREQ_1500    2
+#define M_FREQ_2000    3
+
+#define T_FREQ_10K     0
+#define T_FREQ_12K5    1
+#define T_FREQ_15K     2
+#define T_FREQ_17K5    3
+
+#define L_FREQ_Flat    0
+#define L_FREQ_400Hz   1
+#define L_FREQ_800Hz   2
+#define L_FREQ_2K4     3
+
+#if DEBUG_MSG_ON
+#define DBG0(CODE) if(1){CODE}
+
+#define DBG1(CODE) if(1){CODE}
+#define DBG2(CODE) if(1){CODE}
+#define DBG3(CODE) if(1){CODE}
+
+//#define DBG1(CODE) if(pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.debugMsgLevel>0){CODE}
+//#define DBG2(CODE) if(pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.debugMsgLevel>1){CODE}
+//#define DBG3(CODE) if(pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.debugMsgLevel>2){CODE}
+#else
+#define DBG0(CODE) if(1){CODE}
+#define DBG1(CODE) if(pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.debugMsgLevel>0){CODE}
+#define DBG2(CODE) if(pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.debugMsgLevel>1){CODE}
+#define DBG3(CODE) if(pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.debugMsgLevel>2){CODE}
+#endif
+#ifdef __cplusplus
+}
+#endif
+
+
+
+#endif// _FLYAUDIO_TDA7419_H_

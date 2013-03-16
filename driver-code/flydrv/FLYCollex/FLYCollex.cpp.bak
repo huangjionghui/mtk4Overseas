@@ -1,0 +1,2539 @@
+// -----------------------------------------------------------------------------
+// File Name    : FLYCollex.cpp
+// Title        : CollexBT Driver
+// Author       : JQilin - Copyright (C) 2011
+// Created      : 2011-02-22  
+// Version      : 0.02
+// Target MCU   : WinCE Driver
+// -----------------------------------------------------------------------------
+// Version History:
+/*
+*******************************************************************************************************************
+>>>修改人：JQilin
+>>修改时间：2011-07-08
+>>修改内容：修改蓝牙电话本返回逻辑
+>>修改时间：2011-06-10
+>>修改内容：待机回来死机问题，串口数据处理溢出问题，蓝牙工作状态检查问题
+>>修改时间：2011-05-28
+>>修改内容：蓝牙基本功能已完成，电话本待完成
+>>---------------华丽分隔线--------------------------<<
+>>修改人：Huangjionghui
+>>修改时间：2011-05-23
+>>增加函数：
+static VOID returnBTPowerStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bWork)
+static VOID returnBTWorkStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BOOL bWork)
+static VOID returnCurrentPhoneBookType(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE type)
+static VOID returnWaitingCallNumber(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BYTE *p, UINT len)
+
+static VOID controlCurrentPhoneBookType(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+static VOID controlWaitingCallType(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BYTE type)
+static VOID controlConnectActiveMobilePhoneStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bConnect)
+
+static BOOL FlyBT_JudgeTheBtPowerIsWorking(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BYTE *p, UINT len)
+>>---------------------------------------------<<
+>>>2011-04-25: V0.03 适应新的硬件
+>>>2011-02-25: V0.02 添加读取电话本功能
+>>>2011-02-22: V0.01 first draft
+********************************************************************************************************************
+*/
+// FLYCollex.cpp : Defines the entry point for the DLL application.
+//
+
+#include <drvlib.h>
+#include <bspregmap.h>
+#include <oemintr.h>
+#include <oemdrvlib.h>
+#include <pegdser.h>
+
+#include "driver_global.h"
+#include "FLYCollex.h"
+#include "SOC_FuncDef.h"
+#include "SOC_Service.h"
+
+PUDD_API_TABLE	  pUDDApiTable=NULL;
+
+//软件编译日期
+#define DIGIT(s, no) ((s)[no] - '0')
+
+const int hours = (10 * DIGIT(__TIME__, 0) + DIGIT(__TIME__, 1));
+const int minutes = (10 * DIGIT(__TIME__, 3) + DIGIT(__TIME__, 4));
+const int seconds = (10 * DIGIT(__TIME__, 6) + DIGIT(__TIME__, 7));
+/* WARNING: This will fail in year 10000 and beyond, as it assumes
+* that a year has four digits. */
+const int year = ( 1000 * DIGIT(__DATE__, 7)
+				  + 100 * DIGIT(__DATE__, 8)
+				  + 10 * DIGIT(__DATE__, 9)
+				  + DIGIT(__DATE__, 10));
+
+/*
+* Jan - 1
+* Feb - 2
+* Mar - 3
+* Apr - 4
+* May - 5
+* Jun - 6
+* Jul - 7
+* Aug - 8
+* Sep - 9
+* Oct - 10
+* Nov - 11
+* Dec - 12
+*/
+
+/* Use the last letter as primary "key" and middle letter whenever
+* two months end in the same letter. */
+const int months = (__DATE__[2] == 'b' ? 2 :
+					(__DATE__[2] == 'y' ? 5 :
+					(__DATE__[2] == 'l' ? 7 :
+					(__DATE__[2] == 'g' ? 8 :
+					(__DATE__[2] == 'p' ? 9 :
+					(__DATE__[2] == 't' ? 10 :
+					(__DATE__[2] == 'v' ? 11 :
+					(__DATE__[2] == 'c' ? 12 :
+					(__DATE__[2] == 'n' ?
+					(__DATE__[1] == 'a' ? 1 : 6) :
+					/* Implicit "r" */
+					(__DATE__[1] == 'a' ? 3 : 4))))))))));
+const int day = ( 10 * (__DATE__[4] == ' ' ? 0 : DIGIT(__DATE__, 4))
+				 + DIGIT(__DATE__, 5));
+//软件编译日期
+
+static VOID powerNormalDeInit(P_FLY_COLLEX_BT_INFO pCollexBTInfo);
+
+static VOID FlyAudioReturnToUser(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *buf,UINT len);
+static BOOL DealBTInfo(P_FLY_COLLEX_BT_INFO pCollexBTInfo);
+static VOID collexBT_Enable(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bEnable);
+static VOID returnMobileStatusInit(P_FLY_COLLEX_BT_INFO pCollexBTInfo);
+VOID
+FBT_PowerUp(DWORD hDeviceContext);
+VOID
+FBT_PowerDown(DWORD hDeviceContext);
+
+static void eventInterSetEvent(P_FLY_COLLEX_BT_INFO pCollexBTInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = TRUE;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = GetTickCount();
+	LeaveCriticalSection(&pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	SetEvent(pCollexBTInfo->hHandleGlobalGlobalEvent);
+}
+
+static void eventInterClrEvent(P_FLY_COLLEX_BT_INFO pCollexBTInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = FALSE;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = 0;
+	LeaveCriticalSection(&pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+}
+
+static BOOL eventInterWhatEventOn(P_FLY_COLLEX_BT_INFO pCollexBTInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat])
+	{
+		LeaveCriticalSection(&pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+		return TRUE;
+	}
+	LeaveCriticalSection(&pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	return FALSE;
+}
+
+#define CONTROL_IO_BTPOWER_G	2
+#define CONTROL_IO_BTPOWER_I	26
+
+#define CONTROL_IO_BTRESET_G	2
+#define CONTROL_IO_BTRESET_I	27
+
+#define CONTROL_IO_BTCE_G	3
+#define CONTROL_IO_BTCE_I	0
+
+static VOID collex_PowerControl_On(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	SOC_IO_Output(CONTROL_IO_BTPOWER_G,CONTROL_IO_BTPOWER_I,1);
+	DBG0(RETAILMSG(1, (TEXT("\r\nCollex PowerControl On")));)
+}
+
+static VOID collex_PowerControl_Off(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	SOC_IO_Output(CONTROL_IO_BTPOWER_G,CONTROL_IO_BTPOWER_I,0);
+	DBG0(RETAILMSG(1, (TEXT("\r\nCollex PowerControl Off")));)
+}
+
+static VOID collex_ResetControl_On(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	SOC_IO_Output(CONTROL_IO_BTRESET_G,CONTROL_IO_BTRESET_I,0);
+	pCollexBTInfo->iAutoResetControlTime = GetTickCount();
+	DBG0(RETAILMSG(1, (TEXT("\r\nCollex ResetControl On")));)
+}
+
+static VOID collex_ResetControl_Off(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	SOC_IO_Output(CONTROL_IO_BTRESET_G,CONTROL_IO_BTRESET_I,1);
+	pCollexBTInfo->iAutoResetControlTime = GetTickCount();
+	DBG0(RETAILMSG(1, (TEXT("\r\nCollex ResetControl Off")));)
+}
+
+static  VOID collex_ChipEnableControl_On(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	SOC_IO_Output(CONTROL_IO_BTCE_G,CONTROL_IO_BTCE_I,0);
+	DBG0(RETAILMSG(1, (TEXT("\r\nCollex ChipEnableControl On")));)
+}
+
+static VOID collex_ChipEnableControl_Off(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	SOC_IO_Output(CONTROL_IO_BTCE_G,CONTROL_IO_BTCE_I,1);
+	DBG0(RETAILMSG(1, (TEXT("\r\nCollex ChipEnableControl Off")));)
+}
+
+static VOID phoneListClearAll(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	P_COLLEX_BT_PHONE_LIST p,nextP;
+	p = pCollexBTInfo->sCollexBTInfo.pBTPhoneList;
+	while(p)
+	{
+		nextP = p->Next;
+		delete p;
+		p = nextP;
+	}
+	pCollexBTInfo->sCollexBTInfo.pBTPhoneList = NULL;
+}
+
+static VOID phoneListClearSelectList(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE iWhichList)
+{
+	P_COLLEX_BT_PHONE_LIST p,nextP,lastP;
+	p = pCollexBTInfo->sCollexBTInfo.pBTPhoneList;
+	while(p)
+	{
+		nextP = p->Next;
+		if (iWhichList == p->iWhichPhoneList)
+		{
+			if (p == pCollexBTInfo->sCollexBTInfo.pBTPhoneList)
+			{
+				pCollexBTInfo->sCollexBTInfo.pBTPhoneList = p->Next;
+			}
+			else
+			{
+				lastP->Next = p->Next;
+			}
+			delete p;
+		}
+		lastP = p;
+		p = nextP;
+	}
+}
+
+P_COLLEX_BT_PHONE_LIST phoneListNewOne(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *buf,UINT len)
+{
+	P_COLLEX_BT_PHONE_LIST newP;//添加一个电话
+	newP = new COLLEX_BT_PHONE_LIST;
+
+	if ((len-1+2) <= (COLLEX_PHONE_NUMBER+COLLEX_PHONE_NAME))
+	{
+		memcpy(newP->cPhoneNumberName,&buf[1],len-1);
+		newP->cPhoneNumberName[len-1] = '\r';newP->cPhoneNumberName[len] = '\n';
+		newP->iPhoneNumberNameLength = len+1;
+	} 
+	else
+	{
+		newP->cPhoneNumberName[0] = '\r';newP->cPhoneNumberName[1] = '\n';
+		newP->iPhoneNumberNameLength = 2;
+	}
+
+	UINT readOffset = 1;
+	UINT writeOffset;
+	newP->iWhichPhoneList = buf[0];
+
+	writeOffset = 0;
+	while (writeOffset < COLLEX_PHONE_NUMBER && readOffset < len && (!(buf[readOffset] == '+' && writeOffset != 0)))
+	{
+		newP->cPhoneNumber[writeOffset++] = buf[readOffset++];
+	}
+
+	readOffset++;
+	newP->iPhoneType = buf[readOffset++];
+
+	readOffset++;
+	writeOffset = 0;
+	while (writeOffset < COLLEX_PHONE_NAME && readOffset < len && (!(buf[readOffset] == '\r' && buf[readOffset+1] == '\n')))
+	{
+		newP->cPhoneName[writeOffset++] = buf[readOffset++];
+		newP->iPhoneNameLength = writeOffset;
+	}
+
+	newP->Next = NULL;
+
+	return newP;
+}
+
+static VOID phoneListAdd(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *buf,UINT len)
+{
+	P_COLLEX_BT_PHONE_LIST p;
+
+	P_COLLEX_BT_PHONE_LIST newP = phoneListNewOne(pCollexBTInfo,buf,len);//添加一个电话
+
+	if (pCollexBTInfo->sCollexBTInfo.pBTPhoneList)
+	{
+		p = pCollexBTInfo->sCollexBTInfo.pBTPhoneList;//添加到链表中
+		while (p->Next)
+		{
+			p = p->Next;
+		}
+		p->Next = newP;
+	}
+	else
+	{
+		pCollexBTInfo->sCollexBTInfo.pBTPhoneList = newP;
+	}
+}
+
+static VOID phoneListReplace(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *buf,UINT len,UINT Count)//Count为某类别的Count
+{
+	P_COLLEX_BT_PHONE_LIST pLast,pCurrent;
+	UINT iCount;
+	pLast = pCollexBTInfo->sCollexBTInfo.pBTPhoneList;
+	pCurrent = pCollexBTInfo->sCollexBTInfo.pBTPhoneList;
+	iCount = 0;
+
+	P_COLLEX_BT_PHONE_LIST newP = phoneListNewOne(pCollexBTInfo,buf,len);//添加一个电话
+
+
+	if (pCurrent)//有
+	{
+		while (pCurrent)
+		{
+			if (pCurrent->iWhichPhoneList == newP->iWhichPhoneList)//此类别
+			{
+				if (iCount == Count)//找到序号
+				{
+					if (pLast == pCurrent)//只会在链表头部出现
+					{
+						newP->Next = pCurrent->Next;
+						pCollexBTInfo->sCollexBTInfo.pBTPhoneList = newP;
+						delete pCurrent;
+					}
+					else
+					{
+						newP->Next = pCurrent->Next;
+						pLast->Next = newP;
+						delete pCurrent;
+					}
+					return;
+				}
+				iCount++;
+			}
+			pLast = pCurrent;
+			pCurrent = pCurrent->Next;
+		}
+		pLast->Next = newP;
+	}
+	else//无，则直接添加
+	{
+		pCollexBTInfo->sCollexBTInfo.pBTPhoneList = newP;
+	}
+}
+
+P_COLLEX_BT_PHONE_LIST phoneListGetSelectOne(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE iWhichSelect,BYTE iCount)
+{
+	P_COLLEX_BT_PHONE_LIST p;
+	UINT iCountCurrent = 0;
+
+	p = pCollexBTInfo->sCollexBTInfo.pBTPhoneList;
+	while (p)
+	{
+		if (iWhichSelect == p->iWhichPhoneList)
+		{
+			if (iCountCurrent == iCount)
+			{
+				return p;
+			}
+			iCountCurrent++;
+		}
+		p = p->Next;
+	}
+
+	return NULL;
+}
+
+UINT phoneListGetSelectCount(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE iWhichSelect)
+{
+	P_COLLEX_BT_PHONE_LIST p;
+	BYTE iCount = 0;
+
+	p = pCollexBTInfo->sCollexBTInfo.pBTPhoneList;
+	while (p)
+	{
+		if (iWhichSelect == p->iWhichPhoneList)
+		{
+			iCount++;
+		}
+		p = p->Next;
+	}
+
+	return iCount;
+}
+
+static void collexPhoneListInit(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	pCollexBTInfo->sCollexBTInfo.iPhoneListType = 0;
+	pCollexBTInfo->sCollexBTInfo._W_iPhoneListType = 0;
+	pCollexBTInfo->sCollexBTInfo.bPhoneListMobileReturn = FALSE;
+	pCollexBTInfo->sCollexBTInfo.iPhoneListMobileReturnCount = 0;
+	pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn = FALSE;
+	pCollexBTInfo->sCollexBTInfo.iPhoneListStart = 0;
+	pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount = 5;
+	pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent = 0;
+	phoneListClearAll(pCollexBTInfo);
+}
+
+static VOID collexBTInfoInit(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bInitAll)
+{
+	UINT i;
+
+	pCollexBTInfo->sCollexBTInfo.bWork = FALSE;//@@@@以后会改
+
+	pCollexBTInfo->sCollexBTInfo.bPaired = FALSE;
+	pCollexBTInfo->sCollexBTInfo.bConnected = FALSE;
+
+	pCollexBTInfo->sCollexBTInfo.iPairedStatus = 0;
+
+	pCollexBTInfo->sCollexBTInfo._W_bPairing = FALSE;
+
+
+	pCollexBTInfo->sCollexBTInfo.iPairedDeviceType = 0;
+	memset(pCollexBTInfo->sCollexBTInfo.BDAddress,0,6);
+
+	memset(pCollexBTInfo->sCollexBTInfo.sVersion,'0',8);
+
+	memset(pCollexBTInfo->sCollexBTInfo.sDeviceName,0,COLLEX_PHONE_NAME);
+	pCollexBTInfo->sCollexBTInfo.iDeviceNameLength = 0;
+
+	memset(pCollexBTInfo->sCollexBTInfo.sWaitingCallNumber,0,COLLEX_PHONE_NAME);
+	pCollexBTInfo->sCollexBTInfo.iWaitingCallLen = 0;
+	pCollexBTInfo->sCollexBTInfo.iWaitingCallType = 0;
+	memset(pCollexBTInfo->sCollexBTInfo.sCallInPhoneNumber,0,COLLEX_PHONE_NUMBER);
+
+	pCollexBTInfo->sCollexBTInfo.cMobileCallStatus = 'H';
+
+	pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus = TRUE;
+	pCollexBTInfo->sCollexBTInfo.iAudioConnectionStatusTime = 0;
+
+	pCollexBTInfo->sCollexBTInfo.bStereoDeviceConnection = FALSE;
+
+	pCollexBTInfo->sCollexBTInfo.mobileBattery = 0;
+	pCollexBTInfo->sCollexBTInfo.mobileSignal = 0;
+	pCollexBTInfo->sCollexBTInfo.mobileVolume = 0;
+
+	collexPhoneListInit(pCollexBTInfo);
+
+	pCollexBTInfo->sCollexBTInfo.bPhoneListNeedReturnFlush = FALSE;
+	for (i = 0;i < 6;i++)
+	{
+		pCollexBTInfo->sCollexBTInfo.bPhoneListPhoneReadFinish[i] = FALSE;
+	}
+
+	if (pCollexBTInfo->bOpen)
+	{
+		returnMobileStatusInit(pCollexBTInfo);
+	}
+}
+
+void throwFirstByte(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *pData,UINT Count)
+{
+	UINT i;
+	if (pData[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nThrow One Data")));)
+	}
+	for (i = 0;i < Count - 1;i++)
+	{
+		pData[i] = pData[i+1];
+	}
+}
+
+static VOID OnCommRecv(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BYTE *buf, UINT buflen)
+{
+	UINT i,j;
+	if (!pCollexBTInfo->bPower)
+	{
+		pCollexBTInfo->BTInfoFrameStatus = 0;
+	}
+
+	for (i = 0; i < buflen; i++)
+	{
+		if (0 == pCollexBTInfo->BTInfoFrameStatus
+			&& 0 == buf[i])
+		{
+			continue;
+		}
+		if (pCollexBTInfo->BTInfoFrameStatus > DATA_COMM_BUFF_LENGTH-10)//多减点吧
+		{
+			throwFirstByte(pCollexBTInfo,pCollexBTInfo->BTInfoFrameBuff,pCollexBTInfo->BTInfoFrameStatus);
+			pCollexBTInfo->BTInfoFrameStatus--;
+		}
+		pCollexBTInfo->BTInfoFrameBuff[pCollexBTInfo->BTInfoFrameStatus++] = buf[i];
+		if (pCollexBTInfo->BTInfoFrameStatus >= 2
+			&& pCollexBTInfo->BTInfoFrameBuff[pCollexBTInfo->BTInfoFrameStatus - 2] == 0x0D
+			&& pCollexBTInfo->BTInfoFrameBuff[pCollexBTInfo->BTInfoFrameStatus - 1] == 0x0A)
+		{
+			pCollexBTInfo->BTInfoFrameBuff[pCollexBTInfo->BTInfoFrameStatus] = 0;
+			pCollexBTInfo->BTInfoFrameBuff[pCollexBTInfo->BTInfoFrameStatus+1] = 0;
+			while (DealBTInfo(pCollexBTInfo))
+			{
+				if (pCollexBTInfo->BTInfoFrameBuff[0] == 0x0D
+					&& pCollexBTInfo->BTInfoFrameBuff[1] == 0x0A)
+				{
+					break;
+				}
+				throwFirstByte(pCollexBTInfo,pCollexBTInfo->BTInfoFrameBuff,pCollexBTInfo->BTInfoFrameStatus);
+				pCollexBTInfo->BTInfoFrameStatus--;
+			}
+			pCollexBTInfo->BTInfoFrameStatus = 0;
+		}
+	}
+	/* 取得控件指针 */
+}
+
+static DWORD WINAPI ThreadFlyBTCommProc(LPVOID pContext)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)pContext;
+	BOOL fReadState;
+	DWORD dwCommModemStatus;
+	DWORD dwLength;
+	COMSTAT ComStat;
+	DWORD dwErrorFlags;
+	BYTE *recvBuf;
+	recvBuf = new BYTE[DATA_COMM_BUFF_LENGTH];
+
+	if (!pCollexBTInfo->hBTComm || pCollexBTInfo->hBTComm == INVALID_HANDLE_VALUE
+		|| pCollexBTInfo->bKillFlyBTCommThread)
+	{
+		DBG1(RETAILMSG(1, (TEXT("\r\nThreadFlyBTCommProc exit with com error")));)
+			return 0;
+	}
+	else
+	{
+		DBG1(RETAILMSG(1, (TEXT("\r\nThreadFlyBTCommProc start")));)
+	}
+
+	while (!pCollexBTInfo->bKillFlyBTCommThread)
+	{
+		//等待串口的事件发生
+		WaitCommEvent (pCollexBTInfo->hBTComm, &dwCommModemStatus, 0);
+		if (dwCommModemStatus & EV_RXCHAR) 
+		{
+			ClearCommError(pCollexBTInfo->hBTComm,&dwErrorFlags,&ComStat);
+			//cbInQue返回在串行驱动程序输入队列中的字符数
+			dwLength=ComStat.cbInQue;
+			if(dwLength>0)
+			{
+				//从串口读取数据
+
+				fReadState=ReadFile(pCollexBTInfo->hBTComm,recvBuf,DATA_COMM_BUFF_LENGTH,&dwLength,NULL);
+				if(!fReadState)
+				{
+					//不能从串口读取数据
+					RETAILMSG(1, (TEXT("\r\nThreadFlyBTCommProc cannot read data!")));
+				}
+				else
+				{
+					//把数据赋值给全局变量
+					OnCommRecv(pCollexBTInfo,recvBuf,dwLength);
+				}
+			}     
+
+		}
+
+		GetCommModemStatus (pCollexBTInfo->hBTComm, &dwCommModemStatus);
+	}
+	delete []recvBuf;
+	pCollexBTInfo->hThreadHandleFlyBTComm = NULL;
+	DBG1(RETAILMSG(1, (TEXT("\r\nThreadFlyBTCommProc exit")));)
+		return 0;
+}
+
+
+BOOL InitDCB(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	DCB PortDCB;
+	//	DWORD dwError;
+	PortDCB.DCBlength = sizeof (DCB);     
+	//得到端口的默认设置信息
+	GetCommState (pCollexBTInfo->hBTComm, &PortDCB);
+
+	//改变DCB结构设置
+
+	PortDCB.BaudRate = 9600;               //波特率 
+	PortDCB.fBinary = TRUE;                 //Win32不支持非二进制串行传输模式，必须为TRUE 
+	PortDCB.fParity = FALSE;                 //启用奇偶校验 
+	PortDCB.fOutxCtsFlow = FALSE;            //串行端口的输出由CTS线控制
+	PortDCB.fOutxDsrFlow = FALSE;           //关闭串行端口的DSR流控制 
+	PortDCB.fDtrControl = DTR_CONTROL_DISABLE;   //启用DTR线
+	PortDCB.fDsrSensitivity = FALSE;        //如果设为TRUE将忽略任何输入的字节，除非DSR线被启用 
+	//PortDCB.fTXContinueOnXoff = TRUE;       //当为TRUE时，如果接收缓冲区已满且驱动程序已传送XOFF字符，将使驱动程序停止传输字符
+	PortDCB.fTXContinueOnXoff = FALSE;
+	PortDCB.fOutX = FALSE;                  //设为TRUE指定XON/XOFF控制被用于控制串行输出 
+	PortDCB.fInX = FALSE;                   //设为TRUE指定XON/XOFF控制被用于控制串行输入 
+	PortDCB.fErrorChar = FALSE;             //WINCE串行驱动程序的默认执行将忽略这个字段 
+	PortDCB.fNull = FALSE;                  //设为TRUE将使串行驱动程序忽略收到的空字节 
+	PortDCB.fRtsControl = RTS_CONTROL_DISABLE;   //启用RTS线 
+	PortDCB.fAbortOnError = FALSE;          //WINCE串行驱动程序的默认执行将忽略这个字段
+	PortDCB.ByteSize = 8;                   //每字节的位数 
+	PortDCB.Parity = NOPARITY;              //无奇偶校验 
+	PortDCB.StopBits = ONESTOPBIT;          //每字节一位停止位 
+	//根据DCB结构配置端口 
+	if (!SetCommState (pCollexBTInfo->hBTComm, &PortDCB))
+	{
+		//不能配置串行端口
+		DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT cann't set DCB!")));)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+BOOL InitCommTimeouts(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	COMMTIMEOUTS CommTimeouts;
+	//	DWORD dwError;
+
+	//得到超时参数
+	GetCommTimeouts (pCollexBTInfo->hBTComm, &CommTimeouts);
+	//改变COMMTIMEOUTS结构设置
+	CommTimeouts.ReadIntervalTimeout = MAXDWORD;  
+	CommTimeouts.ReadTotalTimeoutMultiplier = 0;  
+	CommTimeouts.ReadTotalTimeoutConstant = 0;    
+	CommTimeouts.WriteTotalTimeoutMultiplier = 0;  
+	CommTimeouts.WriteTotalTimeoutConstant = 0;    
+	//设置端口超时值 
+	if (!SetCommTimeouts (pCollexBTInfo->hBTComm, &CommTimeouts))
+	{
+		//不能设置超时值
+		DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT cann't set timeout para!")));)
+			return FALSE;
+	}
+	return TRUE;
+}
+
+static VOID closeBTComm(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	if (!pCollexBTInfo->hBTComm)
+	{
+		return;
+	}
+	pCollexBTInfo->bKillFlyBTCommThread = TRUE;
+
+	SetCommMask(pCollexBTInfo->hBTComm,0);
+
+	if (pCollexBTInfo->hThreadHandleFlyBTComm)
+	{
+		TerminateThread(pCollexBTInfo->hThreadHandleFlyBTComm,0);
+		CloseHandle(pCollexBTInfo->hThreadHandleFlyBTComm);
+	}
+
+	//清除端口上指定信号的状态
+	EscapeCommFunction(pCollexBTInfo->hBTComm,CLRDTR);
+	EscapeCommFunction(pCollexBTInfo->hBTComm,CLRRTS);
+	//清除驱动程序内部的发送和接收队列
+	PurgeComm(pCollexBTInfo->hBTComm,PURGE_TXCLEAR|PURGE_RXCLEAR);
+	//关闭串口
+	CloseHandle(pCollexBTInfo->hBTComm);
+	pCollexBTInfo->hBTComm = NULL;
+
+	while (pCollexBTInfo->hThreadHandleFlyBTComm)
+	{
+		Sleep(10);
+	}
+}
+
+static VOID openBTComm(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	if (pCollexBTInfo->hBTComm)
+	{
+		return;
+	}
+	pCollexBTInfo->hBTComm = CreateFile(TEXT("COM5:"), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	DBG2(RETAILMSG(1, (TEXT("FlyAudio CollexBT open com5!")));)
+
+		if(pCollexBTInfo->hBTComm == INVALID_HANDLE_VALUE)
+		{
+			pCollexBTInfo->hBTComm = NULL;
+			DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT cann't open com!")));)
+				return;
+		}
+		//指定端口监测的事件集
+		SetCommMask(pCollexBTInfo->hBTComm, EV_RXCHAR);					// 串口事件:接收到一个字符 	
+		//分配设备缓冲区
+		SetupComm(pCollexBTInfo->hBTComm, 51200, 512);					// 设置接收与发送的缓冲区大小 
+		//初始化缓冲区中的信息
+		PurgeComm(pCollexBTInfo->hBTComm,PURGE_TXCLEAR|PURGE_RXCLEAR);
+
+		//配置串行端口
+		if(!InitDCB(pCollexBTInfo))
+		{
+			return;
+		}
+
+		//设置端口超时值
+		if(!InitCommTimeouts(pCollexBTInfo))
+		{
+			return;
+		}
+
+		//设置端口上指定信号的状态
+		// SETDTR: 发送DTR (data-terminal-ready)信号
+		// SETRTS: 发送RTS (request-to-send)信号
+		EscapeCommFunction (pCollexBTInfo->hBTComm, SETDTR);
+		EscapeCommFunction (pCollexBTInfo->hBTComm, SETRTS);
+		pCollexBTInfo->bKillFlyBTCommThread = FALSE;
+		DWORD dwThreadID;
+		pCollexBTInfo->hThreadHandleFlyBTComm = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadFlyBTCommProc, //线程的全局函数
+			pCollexBTInfo, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nThreadFlyBTCommProc ID:%x"),dwThreadID));)
+
+			if (NULL == pCollexBTInfo->hThreadHandleFlyBTComm)
+			{
+				DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT CreateThread ThreadFlyBTCommProc!")));)
+					closeBTComm(pCollexBTInfo);
+				return;
+			}
+			DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT Comm init OK!")));)
+}
+
+static VOID FlyAudioReturnToUserPutToBuff(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE data)
+{
+	pCollexBTInfo->buffToUser[pCollexBTInfo->buffToUserHx++] = data;
+	if (pCollexBTInfo->buffToUserHx >= DATA_BUFF_LENGTH)
+	{
+		pCollexBTInfo->buffToUserHx = 0;
+	}
+	if (pCollexBTInfo->buffToUserHx == pCollexBTInfo->buffToUserLx)
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\n\r\n\r\nFlyAudio Collex Buff to user overflow!!!\r\n\r\n\r\n")));)
+	}
+}
+
+static VOID FlyAudioReturnToUser(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *buf,UINT len)
+{
+	BYTE crc;
+	UINT i;
+	DBG2(RETAILMSG(1, (TEXT("\r\nCollexBT return to WinCE:")));)
+		for (i = 0;i < len;i++)
+		{
+			DBG2(RETAILMSG(1, (TEXT(" %X"),buf[i]));)
+		}
+		EnterCriticalSection(&pCollexBTInfo->hCSSendToUser);
+		FlyAudioReturnToUserPutToBuff(pCollexBTInfo,0xFF);
+		FlyAudioReturnToUserPutToBuff(pCollexBTInfo,0x55);
+		FlyAudioReturnToUserPutToBuff(pCollexBTInfo,len+1);
+		crc = len + 1;
+		for(i = 0;i < len;i++)
+		{
+			FlyAudioReturnToUserPutToBuff(pCollexBTInfo,buf[i]);
+			crc += buf[i];
+		}
+		FlyAudioReturnToUserPutToBuff(pCollexBTInfo,crc);
+		LeaveCriticalSection(&pCollexBTInfo->hCSSendToUser);
+		SetEvent(pCollexBTInfo->hBuffToUserDataEvent);
+}
+
+static VOID returnMobilePowerMode(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bPower)
+{
+	BYTE buff[2];
+	buff[0] = 0x01;
+	if (bPower)
+	{
+		buff[1] = 0x01;
+	} 
+	else
+	{
+		buff[1] = 0x00;
+	}
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnMobileWorkMode(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bWork)
+{
+	BYTE buff[2];
+	buff[0] = 0x02;
+	if (bWork)
+	{
+		buff[1] = 0x01;
+	} 
+	else
+	{
+		buff[1] = 0x00;
+	}
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnMobilePairStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bPair)
+{
+	BYTE buff[2];
+	buff[0] = 0x20;
+	if (bPair)
+	{
+		buff[1] = 0x01;
+	} 
+	else
+	{
+		buff[1] = 0x00;
+	}
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnMobileAudioTransfer(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bModule)
+{
+	BYTE buff[2];
+	buff[0] = 0x21;
+	if (bModule)
+	{
+		buff[1] = 0x00;
+	} 
+	else
+	{
+		buff[1] = 0x01;
+	}
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnBTA2DPbConnect(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BOOL bConnect)
+{
+	BYTE buff[2]={0x50,0x00};
+	if (bConnect)
+	{
+		buff[1] = 0x01;
+	}
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnMobileDialStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE para)
+{
+	BYTE buff[2];
+	buff[0] = 0x23;
+	if ('A' == para)
+	{
+		buff[1] = 0x03;
+	} 
+	else if ('R' == para)
+	{
+		buff[1] = 0x01;
+	}
+	else if ('D' == para)
+	{
+		buff[1] = 0x02;
+	}
+	else
+	{
+		buff[1] = 0x00;
+	}
+
+	if (pCollexBTInfo->sCollexBTInfo.cMobileCallStatus == 'H')
+	{
+		pCollexBTInfo->sCollexBTInfo.iWaitingCallLen = 0;
+		memset(pCollexBTInfo->sCollexBTInfo.sCallInPhoneNumber,0,COLLEX_PHONE_NUMBER);
+	}
+
+	//全局
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iBTCallStatus
+		= buff[1];
+	eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_BTCALLSTATUS_CHANGE_ID);
+
+#if COLLEX_AUDIO_TRANS_USE_COLLEX
+#else
+	if (0x00 == buff[1])
+	{
+		returnMobileAudioTransfer(pCollexBTInfo,TRUE);
+	}
+#endif
+
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnMobileLinkStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bLink)
+{
+	BYTE buff[2];
+	buff[0] = 0x22;
+	if (bLink)
+	{
+		buff[1] = 0x01;
+	} 
+	else
+	{
+		buff[1] = 0x00;
+	}
+
+	if (FALSE == bLink)//断开连接肯定不能通话或者用A2DP了
+	{
+		pCollexBTInfo->sCollexBTInfo.cMobileCallStatus = 'H';
+		returnMobileDialStatus(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.cMobileCallStatus);
+		pCollexBTInfo->sCollexBTInfo.bStereoDeviceConnection = FALSE;
+		returnBTA2DPbConnect(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.bStereoDeviceConnection);
+	}
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnMobileDailInNumber(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *p,UINT length)
+{
+	BYTE buff[2+COLLEX_PHONE_NUMBER];
+	buff[0] = 0x23;buff[1] = 0x01;
+	if (length <= COLLEX_PHONE_NUMBER)
+	{
+		if (memcmp(pCollexBTInfo->sCollexBTInfo.sCallInPhoneNumber,p,length))
+		{
+			memcpy(pCollexBTInfo->sCollexBTInfo.sCallInPhoneNumber,p,length);
+			memcpy(&buff[2],p,length);
+			FlyAudioReturnToUser(pCollexBTInfo,buff,length+2);
+		}
+	}
+}
+static VOID returnMobilePhoneList(P_FLY_COLLEX_BT_INFO pCollexBTInfo,P_COLLEX_BT_PHONE_LIST p)
+{
+	BYTE buff[128];
+	buff[0] = 0x27;
+
+	if (p)
+	{
+		memcpy(&buff[1],p->cPhoneNumberName,p->iPhoneNumberNameLength);
+		FlyAudioReturnToUser(pCollexBTInfo,buff,p->iPhoneNumberNameLength+1);
+	}
+}
+static VOID returnMobileName(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *p,UINT len)
+{
+	BYTE buff[1+COLLEX_PHONE_NAME];
+	buff[0] = 0x31;
+	if (len <= COLLEX_PHONE_NAME)
+	{
+		memcpy(&buff[1],p,len);
+		FlyAudioReturnToUser(pCollexBTInfo,buff,len+1);
+	}
+}
+
+////---------------
+//static VOID returnMobileCallInNumber(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *p,UINT len)
+//{
+//	BYTE buff[64];
+//	buff[0] = 0x06;buff[1] = 0x01;
+//	memcpy(&buff[2],p,len);
+//
+//	memcpy(pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.cMobileCallInNumber,p,len);
+//	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.iMobileCallInNumberLength = len;
+//	SetEvent(pCollexBTInfo->hHandleGlobalGlobalEvent);
+//
+//	FlyAudioReturnToUser(pCollexBTInfo,buff,len+2);
+//}
+
+static VOID returnBTVersion(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *p,UINT len)
+{
+	BYTE buff[64];
+	buff[0] = 0x2F;
+	memcpy(&buff[1],p,len);
+	FlyAudioReturnToUser(pCollexBTInfo,buff,len+1);
+}
+
+static VOID returnMobileSignalStrength(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE para)
+{
+	BYTE buff[2];
+	buff[0] = 0x40;buff[1] = para;
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnMobileBattery(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE para)
+{
+	BYTE buff[2];
+	buff[0] = 0x41;buff[1] = para;
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+
+static VOID returnBTPowerStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bWork)
+{
+	BYTE buff[2] = {0x10,0x00};
+	if (bWork)
+	{
+		buff[1] = 0x01;
+	} 
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+static VOID returnCurrentPhoneBookType(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE type)
+{
+	BYTE buff[2]={0x25,0x00};
+	buff[1] = type;
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+static VOID returnBTWorkStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BOOL bWork)
+{
+	BYTE buff[2]={0x30,0x00};
+	if (bWork)
+	{
+		buff[1] = 0x01;
+	}
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+static VOID returnBTPhoneBookReadStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BYTE iStatus)
+{
+	BYTE buff[2]={0x32,0x00};
+	buff[1] = iStatus;
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+static VOID returnBTPhoneBookPageFlush(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[2]={0x33,0x00};
+	FlyAudioReturnToUser(pCollexBTInfo,buff,2);
+}
+static VOID returnWaitingCallNumber(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BYTE *p, UINT len)
+{
+	BYTE buff[64];
+	buff[0] = 0x40;
+	memcpy(&buff[1],p,len);
+	FlyAudioReturnToUser(pCollexBTInfo,buff,len+1);
+}
+
+static VOID returnMobileStatusInit(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	returnMobilePairStatus(pCollexBTInfo,FALSE);
+	returnMobileLinkStatus(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.bConnected);
+	returnMobileDialStatus(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.cMobileCallStatus);
+	returnMobileAudioTransfer(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus);
+	returnMobileName(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.sDeviceName,pCollexBTInfo->sCollexBTInfo.iDeviceNameLength);
+	returnMobileSignalStrength(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.mobileSignal);
+	returnMobileBattery(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.mobileBattery);
+
+	returnBTA2DPbConnect(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.bStereoDeviceConnection);
+	//返回工作状态
+	returnBTWorkStatus(pCollexBTInfo, pCollexBTInfo->sCollexBTInfo.bWork);
+
+}
+
+static VOID control_WriteToCollex(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *p,UINT len)
+{
+	DWORD bufSendLength;
+	DBG2(RETAILMSG(1, (TEXT("\r\nWrite to CollexBT:")));)
+		UINT i;
+	for (i = 0;i < len;i++)//跳过换行符
+	{
+		DBG2(RETAILMSG(1, (TEXT(" %c"),p[i]));)
+	}
+	if (pCollexBTInfo->bUpdater)
+	{
+		DBG2(RETAILMSG(1, (TEXT("break")));)
+			return;
+	}
+	WriteFile(pCollexBTInfo->hBTComm,p,len,&bufSendLength,NULL);
+}
+
+static VOID controlBTDeletePairedDevice(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[9];
+	buff[0] = 'e';
+	buff[1] = 0xFF;buff[2] = 0xFF;buff[3] = 0xFF;
+	buff[4] = 0xFF;buff[5] = 0xFF;buff[6] = 0xFF;
+	buff[7] = '\r';buff[8] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,9);
+}
+
+static VOID controlBTAudioTrans(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[3];
+	buff[0] = 't';buff[1] = '\r';buff[2] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,3);
+}
+
+static VOID controlBTPair(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[3];
+	buff[0] = 'p';buff[1] = '\r';buff[2] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,3);
+}
+
+static VOID controlBTReqVersion(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[3];
+	buff[0] = 'i';buff[1] = '\r';buff[2] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,3);
+}
+
+static VOID controlBTAnswerCall(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[3];
+	buff[0] = 'a';buff[1] = '\r';buff[2] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,3);
+}
+
+static VOID controlBTHangCall(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[3];
+	buff[0] = 'h';buff[1] = '\r';buff[2] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,3);
+}
+
+static VOID controlBTDailNumber(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *p,UINT len)
+{
+	BYTE buff[64];
+	buff[0] = 'd';
+	memcpy(&buff[1],p,len);
+	buff[len + 1] = '\r';buff[len + 2] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,len + 3);
+}
+
+static VOID controlBTReqMobileName(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[3];
+	buff[0] = 'q';buff[1] = '\r';buff[2] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,3);
+}
+
+static VOID controlBTDTMFKey(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE key)
+{
+	BYTE buff[4];
+	buff[0] = 'k';
+	buff[1] = key;
+	buff[2] = '\r';buff[3] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,4);
+}
+
+static VOID controlBTSelectPhoneBook(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE phoneBook)
+{
+	BYTE buff[5];
+	buff[0] = 'b';
+	buff[1] = '0';
+	buff[2] = phoneBook;
+	buff[3] = '\r';buff[4] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,5);
+}
+
+static VOID controlBTReqPhoneBookListOne(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE phoneBook)
+{
+	BYTE buff[5];
+	buff[0] = 'b';
+	buff[1] = '1';
+	buff[2] = '1';
+	buff[3] = '\r';buff[4] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,5);
+}
+
+static VOID controlBTReqPhoneBookListFive(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE phoneBook)
+{
+	BYTE buff[5];
+	buff[0] = 'b';
+	buff[1] = '2';
+	buff[2] = '1';
+	buff[3] = '\r';buff[4] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,5);
+}
+
+static VOID controlBTReqPhoneBookListAll(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE phoneBook)
+{
+	BYTE buff[5];
+	buff[0] = 'b';
+	buff[1] = '3';
+	buff[2] = '0';
+	buff[3] = '\r';buff[4] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,5);
+}
+
+static VOID controlBTVolumeControl(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE key)
+{
+	BYTE buff[4];
+	buff[0] = 's';
+	buff[1] = key;
+	buff[2] = '\r';buff[3] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,4);
+}
+
+static VOID controlCurrentPhoneBookType(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[5];
+	buff[0] = 'b';
+	buff[1] = '0'; buff[2] = '0';
+	buff[3] = '\r';buff[4] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,5);
+}
+static VOID controlConnectActiveMobilePhoneStatus(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bConnect)
+{
+	BYTE buff[4];
+	buff[0] = 'c';
+	if (bConnect)
+	{
+		buff[1] = '1';
+	}
+	else
+	{
+		buff[1] = '0'; 
+	}
+	buff[2] = '\r';buff[3] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,4);
+}
+static VOID controlWaitingCallType(P_FLY_COLLEX_BT_INFO pCollexBTInfo, BYTE type)
+{
+	BYTE buff[4];
+	buff[0] = 'w';
+	buff[1] = type+'0';
+	buff[2] = '\r';buff[3] = '\n';
+	control_WriteToCollex(pCollexBTInfo,buff,4);
+}
+
+static VOID controlBTUseInnerMic(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bInner)
+{
+	BYTE buff[5] = {'j','a','1','\r','\n'};
+
+	if (bInner)
+	{
+		buff[2] = '2';
+	}
+
+	control_WriteToCollex(pCollexBTInfo,buff,5);
+}
+
+static VOID controlBTWarmReset(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	BYTE buff[3] = {'r','\r','\n'};
+
+	control_WriteToCollex(pCollexBTInfo,buff,3);
+}
+
+static VOID controlA2DPButtom(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE iButtom,BYTE bPressed)
+{
+	BYTE buff[5] = {'n','1','1','\r','\n'};
+
+	buff[1] = iButtom;
+	buff[2] = bPressed;
+	control_WriteToCollex(pCollexBTInfo,buff,5);
+}
+
+static BOOL DealBTInfo(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	UINT i;
+	BOOL bMsgHandle = TRUE;
+	BOOL bRet = FALSE;
+
+	if (pCollexBTInfo->BTInfoFrameBuff[0] == 0x00)
+	{
+		bRet = TRUE;
+		return bRet;
+	}
+
+	//	if ('I' != pCollexBTInfo->BTInfoFrameBuff[0])
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nCollexBT decode:")));)
+		for (i = 0;i < pCollexBTInfo->BTInfoFrameStatus - 2;i++)//跳过换行符
+		{
+			if (pCollexBTInfo->BTInfoFrameBuff[i] < 0x20 || pCollexBTInfo->BTInfoFrameBuff[i] > 0x7F)
+			{
+				DBG2(RETAILMSG(1, (TEXT("0x%x"),pCollexBTInfo->BTInfoFrameBuff[i]));)
+			}
+			else
+			{
+				DBG2(RETAILMSG(1, (TEXT("%c"),pCollexBTInfo->BTInfoFrameBuff[i]));)
+			}
+		}
+		if ('I' == pCollexBTInfo->BTInfoFrameBuff[0])
+		{
+			DBG2(RETAILMSG(1, (TEXT("********")));)
+		}
+	}
+
+	switch (pCollexBTInfo->BTInfoFrameBuff[0])
+	{
+	case 'E':
+		break;
+	case 'C':
+		{
+			UINT iDailInNumberLength = 0;
+			while (iDailInNumberLength < pCollexBTInfo->BTInfoFrameStatus - 1
+				&& pCollexBTInfo->BTInfoFrameBuff[iDailInNumberLength + 1] != '\r')
+			{
+				if (pCollexBTInfo->BTInfoFrameBuff[iDailInNumberLength + 1] == '+' && iDailInNumberLength)
+				{
+					break;
+				}
+				iDailInNumberLength++;
+			}
+			returnMobileDailInNumber(pCollexBTInfo,&pCollexBTInfo->BTInfoFrameBuff[1],iDailInNumberLength);
+		}
+		break;
+	case 'B':
+		if ('0' == pCollexBTInfo->BTInfoFrameBuff[1])
+		{
+			pCollexBTInfo->sCollexBTInfo.iPhoneListType = pCollexBTInfo->BTInfoFrameBuff[2];
+			pCollexBTInfo->sCollexBTInfo.iPhoneListMobileReturnCount = 0;
+
+			if (pCollexBTInfo->sCollexBTInfo._W_iPhoneListType == pCollexBTInfo->sCollexBTInfo.iPhoneListType)
+			{
+				//controlBTReqPhoneBookListAll(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.iPhoneListType);
+				controlBTReqPhoneBookListFive(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.iPhoneListType);
+				//returnCurrentPhoneBookType(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.iPhoneListType-'0');
+			}
+		}
+		else if ('1' == pCollexBTInfo->BTInfoFrameBuff[1])
+		{
+			//phoneListAdd(pCollexBTInfo,&pCollexBTInfo->BTInfoFrameBuff[2],pCollexBTInfo->BTInfoFrameStatus-2);
+			phoneListReplace(pCollexBTInfo,&pCollexBTInfo->BTInfoFrameBuff[2],pCollexBTInfo->BTInfoFrameStatus-2,pCollexBTInfo->sCollexBTInfo.iPhoneListMobileReturnCount);
+			pCollexBTInfo->sCollexBTInfo.iPhoneListMobileReturnCount++;
+			if (pCollexBTInfo->sCollexBTInfo.iPhoneListType >= '0'
+				&& pCollexBTInfo->sCollexBTInfo.iPhoneListType <= '6')
+			{
+				if (pCollexBTInfo->sCollexBTInfo.iPhoneListMobileReturnCount > phoneListGetSelectCount(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.iPhoneListType))
+				{
+					pCollexBTInfo->sCollexBTInfo.iPhoneListMobileReturnCount = phoneListGetSelectCount(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.iPhoneListType);
+				}
+			}
+			pCollexBTInfo->sCollexBTInfo.bPhoneListMobileReturn = TRUE;
+		}
+		else if ('2' == pCollexBTInfo->BTInfoFrameBuff[1])
+		{
+			if ('1' == pCollexBTInfo->BTInfoFrameBuff[2])
+			{
+				if (pCollexBTInfo->sCollexBTInfo._W_iPhoneListType == pCollexBTInfo->sCollexBTInfo.iPhoneListType)
+				{
+					if (pCollexBTInfo->sCollexBTInfo.bPhoneListMobileReturn)
+					{
+						pCollexBTInfo->sCollexBTInfo.bPhoneListMobileReturn = FALSE;
+						controlBTReqPhoneBookListFive(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.iPhoneListType);
+					}
+					else
+					{
+						if (pCollexBTInfo->sCollexBTInfo.iPhoneListType >= '0'
+							&& pCollexBTInfo->sCollexBTInfo.iPhoneListType <= '6')
+						{
+							pCollexBTInfo->sCollexBTInfo.bPhoneListPhoneReadFinish[pCollexBTInfo->sCollexBTInfo.iPhoneListType - '0'] = TRUE;
+						}
+					}
+				}
+			}
+			else if ('3' == pCollexBTInfo->BTInfoFrameBuff[2] || '6' == pCollexBTInfo->BTInfoFrameBuff[2])
+			{
+				if (pCollexBTInfo->sCollexBTInfo._W_iPhoneListType == pCollexBTInfo->sCollexBTInfo.iPhoneListType)
+				{
+					pCollexBTInfo->sCollexBTInfo.iPhoneListType = 0xFF;//蓝牙返回无法获取电话本
+					returnBTPhoneBookReadStatus(pCollexBTInfo,pCollexBTInfo->BTInfoFrameBuff[2] - '0');
+				}
+			}
+		}
+
+		if (pCollexBTInfo->sCollexBTInfo._W_iPhoneListType != pCollexBTInfo->sCollexBTInfo.iPhoneListType)
+		{
+			//pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn = FALSE;
+			if ('2' == pCollexBTInfo->BTInfoFrameBuff[1])
+			{
+				if ('1' == pCollexBTInfo->BTInfoFrameBuff[2]
+				|| '2' == pCollexBTInfo->BTInfoFrameBuff[2]
+				|| '4' == pCollexBTInfo->BTInfoFrameBuff[2])
+				{
+					controlBTSelectPhoneBook(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType);
+				}
+			}
+		}
+		else
+		{
+			pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn = TRUE;
+			SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+		}
+		break;
+	case 'I':
+		pCollexBTInfo->iAutoResetControlTime = GetTickCount();
+		if (memcmp(&pCollexBTInfo->sCollexBTInfo.sVersion[0],&pCollexBTInfo->BTInfoFrameBuff[1],8))
+		{
+			memcpy(&pCollexBTInfo->sCollexBTInfo.sVersion[0],&pCollexBTInfo->BTInfoFrameBuff[1],8);
+			memcpy(&pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iBTSoftwareVersion[0],&pCollexBTInfo->BTInfoFrameBuff[1],8);
+			pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iBTSoftwareVersionLength = 8;
+			eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_RETURN_BT_VERSION_ID);
+
+			returnBTVersion(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.sVersion,8);
+		}
+		break;
+	case 'D':case 'A':case 'R':case 'H':
+		pCollexBTInfo->sCollexBTInfo.cMobileCallStatus = pCollexBTInfo->BTInfoFrameBuff[0];
+		returnMobileDialStatus(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.cMobileCallStatus);
+		break;
+	case 'U':
+		if (pCollexBTInfo->BTInfoFrameBuff[1] == '0')
+		{
+			pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus = FALSE;
+		} 
+		else
+		{
+			pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus = TRUE;
+		}
+		pCollexBTInfo->sCollexBTInfo.iAudioConnectionStatusTime = GetTickCount();
+
+#if COLLEX_AUDIO_TRANS_USE_COLLEX
+		returnMobileAudioTransfer(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus);//根据蓝牙返回同步界面
+#endif
+		break;
+	case 'Q':
+		memset(&pCollexBTInfo->sCollexBTInfo.sDeviceName[0],0,COLLEX_PHONE_NAME);
+		memcpy(&pCollexBTInfo->sCollexBTInfo.sDeviceName[0],&pCollexBTInfo->BTInfoFrameBuff[1],pCollexBTInfo->BTInfoFrameStatus-3);
+		pCollexBTInfo->sCollexBTInfo.iDeviceNameLength = pCollexBTInfo->BTInfoFrameStatus - 3;
+
+		pCollexBTInfo->sCollexBTInfo._W_bPairing = FALSE;
+		returnMobilePairStatus(pCollexBTInfo,FALSE);//联通
+		returnMobileName(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.sDeviceName,pCollexBTInfo->sCollexBTInfo.iDeviceNameLength);
+		break;
+	case 'P':
+		pCollexBTInfo->sCollexBTInfo.iPairedStatus = pCollexBTInfo->BTInfoFrameBuff[1];
+		if ('R' == pCollexBTInfo->BTInfoFrameBuff[1])
+		{
+			returnMobilePairStatus(pCollexBTInfo,TRUE);
+		}
+		else if ('0' == pCollexBTInfo->BTInfoFrameBuff[1])//配对失败
+		{
+			pCollexBTInfo->sCollexBTInfo._W_bPairing = FALSE;
+		}
+		SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+		//其它暂不处理
+		break;
+	case 'X':
+		if (pCollexBTInfo->BTInfoFrameBuff[1] == '3')
+		{
+			if (pCollexBTInfo->BTInfoFrameBuff[2] == '0')
+			{
+				DBG2(RETAILMSG(1, (TEXT("\r\nCollexBT Control Enter Mute")));)
+				if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable)
+				{
+					eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_REQ_ID);//发送进入静音
+					while (!eventInterWhatEventOn(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_OK_ID))//等待OK
+					{
+						Sleep(100);
+					}
+					pCollexBTInfo->bControlAudioMuteLongTime = TRUE;
+					pCollexBTInfo->iControlAudioMuteTime = GetTickCount();
+					eventInterClrEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_OK_ID);//清除
+				}
+			}
+			else if (pCollexBTInfo->BTInfoFrameBuff[2] == '1')
+			{
+				DBG2(RETAILMSG(1, (TEXT("\r\nCollexBT Control Exit Mute")));)
+				Sleep(1000);
+				if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable)
+				{
+					pCollexBTInfo->bControlAudioMuteLongTime = FALSE;
+					pCollexBTInfo->iControlAudioMuteTime = 0;
+					eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_OUT_REQ_ID);//发送退出静音
+				}
+			}
+		}
+		else if (pCollexBTInfo->BTInfoFrameBuff[1] == '0')
+		{
+			pCollexBTInfo->sCollexBTInfo.bStereoDeviceConnection = FALSE;
+		}
+		else
+		{
+			pCollexBTInfo->sCollexBTInfo.bStereoDeviceConnection = TRUE;
+		}
+		returnBTA2DPbConnect(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.bStereoDeviceConnection);
+		break;
+	case 'Y':
+		pCollexBTInfo->sCollexBTInfo.iPairedDeviceType = pCollexBTInfo->BTInfoFrameBuff[1];
+		memcpy(&pCollexBTInfo->sCollexBTInfo.BDAddress[0],&pCollexBTInfo->BTInfoFrameBuff[2],6);
+		pCollexBTInfo->sCollexBTInfo._W_bPairing = FALSE;
+		if ('1' == pCollexBTInfo->BTInfoFrameBuff[1] || '2' == pCollexBTInfo->BTInfoFrameBuff[1])
+		{
+			if (pCollexBTInfo->BTInfoFrameStatus > (2+6+2))
+			{
+				memset(&pCollexBTInfo->sCollexBTInfo.sDeviceName[0],0,COLLEX_PHONE_NAME);
+				memcpy(&pCollexBTInfo->sCollexBTInfo.sDeviceName[0],&pCollexBTInfo->BTInfoFrameBuff[8],pCollexBTInfo->BTInfoFrameStatus-(2+6+2));
+				pCollexBTInfo->sCollexBTInfo.iDeviceNameLength = pCollexBTInfo->BTInfoFrameStatus - (2+6+2);
+
+				returnMobilePairStatus(pCollexBTInfo,FALSE);
+				returnMobileName(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.sDeviceName,pCollexBTInfo->sCollexBTInfo.iDeviceNameLength);
+			}
+		}
+		break;
+	case 'S':
+		if (pCollexBTInfo->BTInfoFrameBuff[2] == '0')
+		{
+			pCollexBTInfo->sCollexBTInfo.bPaired = FALSE;
+		} 
+		else
+		{
+			pCollexBTInfo->sCollexBTInfo.bPaired = TRUE;
+
+			if (pCollexBTInfo->BTInfoFrameBuff[3] == '1')//配对后才有有效连接
+			{
+				pCollexBTInfo->sCollexBTInfo.bConnected = TRUE;
+				pCollexBTInfo->sCollexBTInfo._W_bPairing = FALSE;
+			}
+		}
+
+		if (pCollexBTInfo->BTInfoFrameBuff[3] == '0')
+		{
+			pCollexBTInfo->sCollexBTInfo.bConnected = FALSE;
+
+			memset(&pCollexBTInfo->sCollexBTInfo.sDeviceName[0],0,COLLEX_PHONE_NAME);
+			pCollexBTInfo->sCollexBTInfo.iDeviceNameLength = 0;
+			collexPhoneListInit(pCollexBTInfo);
+		} 
+
+		returnMobileLinkStatus(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.bConnected);
+		break;
+	case 'J':
+		if (pCollexBTInfo->BTInfoFrameBuff[1] == '0')
+		{
+			pCollexBTInfo->sCollexBTInfo.mobileBattery = pCollexBTInfo->BTInfoFrameBuff[2] - '0';
+			returnMobileBattery(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.mobileBattery);
+		}
+		else if (pCollexBTInfo->BTInfoFrameBuff[1] == '1')
+		{
+			pCollexBTInfo->sCollexBTInfo.mobileSignal = pCollexBTInfo->BTInfoFrameBuff[2] - '0';
+			returnMobileSignalStrength(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.mobileSignal);
+		}
+		else if (pCollexBTInfo->BTInfoFrameBuff[1] == '2')
+		{
+			pCollexBTInfo->sCollexBTInfo.mobileVolume = (pCollexBTInfo->BTInfoFrameBuff[2] - '0') * 10 + (pCollexBTInfo->BTInfoFrameBuff[3] - '0');
+		}
+		break;
+
+	case 'W':
+		if ('A' == pCollexBTInfo->sCollexBTInfo.cMobileCallStatus 
+			&& 0 == pCollexBTInfo->sCollexBTInfo.iWaitingCallLen)
+		{
+			memset(&pCollexBTInfo->sCollexBTInfo.sWaitingCallNumber[0],0,COLLEX_PHONE_NAME);
+			memcpy(&pCollexBTInfo->sCollexBTInfo.sWaitingCallNumber[0],
+				&pCollexBTInfo->BTInfoFrameBuff[1],pCollexBTInfo->BTInfoFrameStatus-3);
+			pCollexBTInfo->sCollexBTInfo.iWaitingCallLen = pCollexBTInfo->BTInfoFrameStatus - 3;
+			returnWaitingCallNumber(pCollexBTInfo,
+				pCollexBTInfo->sCollexBTInfo.sWaitingCallNumber,pCollexBTInfo->sCollexBTInfo.iWaitingCallLen);
+		}
+		break;
+	default:
+		bMsgHandle = FALSE;
+		bRet = TRUE;
+		DBG2(RETAILMSG(1, (TEXT("unHandle!")));)
+		break;
+	}
+
+	if (bMsgHandle && !pCollexBTInfo->sCollexBTInfo.bWork)//蓝牙工作
+	{
+		pCollexBTInfo->sCollexBTInfo.bWork = TRUE;
+		returnBTWorkStatus(pCollexBTInfo, pCollexBTInfo->sCollexBTInfo.bWork);
+	}
+
+	if (FALSE == bRet)
+	{
+		pCollexBTInfo->iAutoResetControlTime = GetTickCount();
+	}
+	return bRet;
+}
+
+static void controlBTPowerControl(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bPowerOn)
+{
+	if (bPowerOn)
+	{
+		collexBTInfoInit(pCollexBTInfo,FALSE);
+		collex_PowerControl_On(pCollexBTInfo);//打开蓝牙电源
+		pCollexBTInfo->bPower = TRUE;
+
+		pCollexBTInfo->sCollexBTInfo.cMobileCallStatus = 'H';
+		returnMobileDialStatus(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.cMobileCallStatus);
+	}
+	else
+	{
+		powerNormalDeInit(pCollexBTInfo);
+		collexBTInfoInit(pCollexBTInfo,TRUE);
+	}
+}
+
+static VOID WinCECommandProcessor(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BYTE *buf,UINT len)
+{
+	DBG2(RETAILMSG(1, (TEXT(" OK!")));)
+
+		switch(buf[0])
+	{
+		case 0x01:
+			if (0x01 == buf[1])
+			{
+				pCollexBTInfo->controlPower = FALSE;
+				pCollexBTInfo->currentPower = FALSE;
+				returnMobileStatusInit(pCollexBTInfo);
+				//collexBTInfoInit(pCollexBTInfo,FALSE);
+				returnMobilePowerMode(pCollexBTInfo,TRUE);//电源开
+				returnMobileWorkMode(pCollexBTInfo,TRUE);//初始化正常
+				pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeBTSleep = TRUE;
+				pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeBTSleep = FALSE;
+			}
+			else if (0x00 == buf[1])
+			{
+				pCollexBTInfo->controlPower = FALSE;
+				pCollexBTInfo->currentPower = FALSE;
+				collexBTInfoInit(pCollexBTInfo,TRUE);
+				returnMobileWorkMode(pCollexBTInfo,FALSE);//初始化中
+				returnMobilePowerMode(pCollexBTInfo,FALSE); //电源关
+			}
+			break;
+		case 0x03:
+			if (buf[1] == 0x00)
+			{
+
+			}
+			else 
+			{
+				if ('H' == pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)
+				{
+					if (0x01 == buf[1])
+					{
+						controlBTVolumeControl(pCollexBTInfo,'2');
+					} 
+					else if (0x02 == buf[1])
+					{
+						controlBTVolumeControl(pCollexBTInfo,'3');
+					}
+				}
+				else
+				{
+					if (0x01 == buf[1])
+					{
+						controlBTVolumeControl(pCollexBTInfo,'0');
+					} 
+					else if (0x02 == buf[1])
+					{
+						controlBTVolumeControl(pCollexBTInfo,'1');
+					}
+				}
+			}	 
+			break;
+		case 0x04:
+			controlA2DPButtom(pCollexBTInfo,buf[1]+'0',buf[2]+'0');
+			//pCollexBTInfo->xxxxxxxx = TRUE;
+			break;
+		case 0x10:
+			if (0x01 == buf[1])
+			{
+				pCollexBTInfo->controlPower = TRUE;
+				SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+				returnBTPowerStatus(pCollexBTInfo,TRUE);
+			}
+			else
+			{
+				pCollexBTInfo->controlPower = FALSE;
+				SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+				returnBTPowerStatus(pCollexBTInfo,FALSE);
+			}
+			break;
+
+		case 0x20:
+			if (pCollexBTInfo->sCollexBTInfo.bWork)
+			{
+				if (1 == buf[1])//启动配对
+				{
+					pCollexBTInfo->sCollexBTInfo.iPairedStatus = 0;
+					pCollexBTInfo->sCollexBTInfo._W_bPairing = TRUE;
+					returnMobilePairStatus(pCollexBTInfo,TRUE);
+				}
+				else
+				{
+					pCollexBTInfo->sCollexBTInfo._W_bPairing = FALSE;
+					if ('R' == pCollexBTInfo->sCollexBTInfo.iPairedStatus)
+					{
+						controlBTPair(pCollexBTInfo);
+					}
+					returnMobilePairStatus(pCollexBTInfo,FALSE);
+				}
+				SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+			}
+			DBG2(RETAILMSG(1, (TEXT("FlyAudio WinCE Pair %d\r\n"),buf[1]));)
+				break;
+		case 0x21:
+			if ('A' == pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)
+			{
+				if (0x01 == buf[1])//手机
+				{
+					if (pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus)
+					{
+						FlyAudioReturnToUser(pCollexBTInfo,buf,len);
+						if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable)
+						{
+							eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_REQ_ID);//发送进入静音
+							while (!eventInterWhatEventOn(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_OK_ID))//等待OK
+							{
+								Sleep(100);
+							}
+							pCollexBTInfo->iControlAudioMuteTime = GetTickCount();
+							eventInterClrEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_OK_ID);//清除
+						}
+
+						controlBTAudioTrans(pCollexBTInfo);					
+					}
+				} 
+				else if (0x00 == buf[1])//模块
+				{
+					if (!pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus)
+					{
+						FlyAudioReturnToUser(pCollexBTInfo,buf,len);
+						if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable)
+						{
+							eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_REQ_ID);//发送进入静音
+							while (!eventInterWhatEventOn(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_OK_ID))//等待OK
+							{
+								Sleep(100);
+							}
+							pCollexBTInfo->iControlAudioMuteTime = GetTickCount();
+							eventInterClrEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_OK_ID);//清除
+						}
+
+						controlBTAudioTrans(pCollexBTInfo);					
+					}
+				}
+			}
+			break;
+
+		case 0x22:
+			if (0x01 == buf[1])
+			{
+				if (!pCollexBTInfo->sCollexBTInfo.bConnected)
+				{	
+					controlConnectActiveMobilePhoneStatus(pCollexBTInfo, TRUE);
+				}
+			}
+			else
+			{
+				if (pCollexBTInfo->sCollexBTInfo.bConnected)
+				{	
+					controlConnectActiveMobilePhoneStatus(pCollexBTInfo, FALSE);
+				}
+			}
+			break;
+
+		case 0x23:
+			if (0x02 == buf[1])//呼出电话
+			{
+				if (pCollexBTInfo->sCollexBTInfo.bConnected)
+				{
+					if ('H' == pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)
+					{
+						controlBTDailNumber(pCollexBTInfo,&buf[2],len - 2);
+					}
+					else
+					{
+						DBG2(RETAILMSG(1, (TEXT("\r\ndail but not in H mode")));)
+					}
+				}
+				else
+				{
+					DBG2(RETAILMSG(1, (TEXT("\r\ndail but not connect")));)
+				}
+			}
+			else if (0x00 == buf[1])
+			{
+				if ('H' == pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)
+				{
+					returnMobileDialStatus(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.cMobileCallStatus);
+				}
+				else
+				{
+					pCollexBTInfo->iBTSelfReturnHandDownTime = GetTickCount();
+				}
+				controlBTHangCall(pCollexBTInfo);
+			}
+			else if (0x01 == buf[1])
+			{
+				controlBTAnswerCall(pCollexBTInfo);
+			}
+			break;
+		case 0x24:
+			if (pCollexBTInfo->sCollexBTInfo.bConnected)
+			{
+				if ('A' == pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)
+				{
+					controlBTDTMFKey(pCollexBTInfo,buf[1]);
+				}
+			}
+			break;
+		case 0x25:
+			if (pCollexBTInfo->sCollexBTInfo.bConnected)
+			{
+				controlCurrentPhoneBookType(pCollexBTInfo);
+			}
+			break;
+
+		case 0x26:
+			if (buf[1] <= 0x06)
+			{
+				if (pCollexBTInfo->sCollexBTInfo._W_iPhoneListType != (buf[1] + '0'))
+				{
+					pCollexBTInfo->sCollexBTInfo._W_iPhoneListType = buf[1] + '0';
+					pCollexBTInfo->sCollexBTInfo.iPhoneListStart = 0;
+					pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount = buf[2];
+					pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent = 0;
+
+					controlBTSelectPhoneBook(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType);
+
+					pCollexBTInfo->sCollexBTInfo.bPhoneListNeedReturnFlush = TRUE;
+					pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn = TRUE;
+					SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+				}
+			}
+			break;
+		case 0x27:
+			if (0x01 == buf[1])
+			{
+				if (pCollexBTInfo->sCollexBTInfo.iPhoneListStart + pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount
+					< phoneListGetSelectCount(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType))
+				{
+					pCollexBTInfo->sCollexBTInfo.iPhoneListStart += pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount;
+					pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent = 0;
+					pCollexBTInfo->sCollexBTInfo.bPhoneListNeedReturnFlush = TRUE;
+					pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn = TRUE;
+				}
+			} 
+			else if (0x00 == buf[1])
+			{
+				if (pCollexBTInfo->sCollexBTInfo.iPhoneListStart > pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount)
+				{
+					pCollexBTInfo->sCollexBTInfo.iPhoneListStart -= pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount;
+					pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent = 0;
+					pCollexBTInfo->sCollexBTInfo.bPhoneListNeedReturnFlush = TRUE;
+					pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn = TRUE;
+				}
+				else if (pCollexBTInfo->sCollexBTInfo.iPhoneListStart)
+				{
+					pCollexBTInfo->sCollexBTInfo.iPhoneListStart = 0;
+					pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent = 0;
+					pCollexBTInfo->sCollexBTInfo.bPhoneListNeedReturnFlush = TRUE;
+					pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn = TRUE;
+				}
+				else
+				{
+					pCollexBTInfo->sCollexBTInfo.iPhoneListStart = 0;
+					pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent = 0;
+				}
+			}
+			SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+			break;
+
+			//case 0x40:
+			//	if (0<=buf[1] && buf[1]<4)
+			//	{
+			//		pCollexBTInfo->sCollexBTInfo.iWaitingCallType = buf[1];
+			//		controlWaitingCallType(pCollexBTInfo, pCollexBTInfo->sCollexBTInfo.iWaitingCallType);
+			//	}
+			//	break;
+		case 0x80:
+			if (0x01 == buf[1])
+			{
+				pCollexBTInfo->bUpdater = TRUE;
+				closeBTComm(pCollexBTInfo);
+				FlyAudioReturnToUser(pCollexBTInfo,buf,len);
+			}
+			else if (0x00 == buf[1])
+			{
+				openBTComm(pCollexBTInfo);
+				pCollexBTInfo->bUpdater = FALSE;
+				FlyAudioReturnToUser(pCollexBTInfo,buf,len);
+			}
+			break;
+		case 0xFF:
+			if (0x01 == buf[1])
+			{
+				FBT_PowerUp((DWORD)pCollexBTInfo);
+			} 
+			else if (0x00 == buf[1])
+			{
+				FBT_PowerDown((DWORD)pCollexBTInfo);
+			}
+		default:
+			break;
+	}
+}
+
+static DWORD WINAPI ThreadCollexBTMainProc(LPVOID pContext)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)pContext;
+	ULONG WaitReturn;
+
+	while (!pCollexBTInfo->bKillCollexBTMainThread)
+	{
+		if (pCollexBTInfo->sCollexBTInfo._W_bPairing
+			|| pCollexBTInfo->iControlAudioMuteTime)
+		{
+			WaitReturn = WaitForSingleObject(pCollexBTInfo->hCollexBTMainThreadEvent, 314);
+		}
+		else
+		{
+			WaitReturn = WaitForSingleObject(pCollexBTInfo->hCollexBTMainThreadEvent, 2000);
+		}
+
+		if (pCollexBTInfo->xxxxxxxx)//测试挂掉
+		{
+			BYTE *p;
+			p = 0x00000000;
+			*p = 12345678;
+		}
+
+		if (pCollexBTInfo->iBTSelfReturnHandDownTime
+			&& GetTickCount() - pCollexBTInfo->iBTSelfReturnHandDownTime >= 618)
+		{
+			pCollexBTInfo->iBTSelfReturnHandDownTime = 0;
+			if ('H' != pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)
+			{
+				pCollexBTInfo->sCollexBTInfo.cMobileCallStatus = 'H';
+				returnMobileDialStatus(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.cMobileCallStatus);
+			}
+		}
+
+		if (pCollexBTInfo->iControlAudioMuteTime
+			&& 
+			((pCollexBTInfo->bControlAudioMuteLongTime && GetTickCount() - pCollexBTInfo->iControlAudioMuteTime >= 5000)
+			|| (!pCollexBTInfo->bControlAudioMuteLongTime && GetTickCount() - pCollexBTInfo->iControlAudioMuteTime >= 1200))
+			)
+		{
+			DBG2(RETAILMSG(1, (TEXT("\r\nCollexBT Auto Exit Mute")));)
+			pCollexBTInfo->bControlAudioMuteLongTime = FALSE;
+			pCollexBTInfo->iControlAudioMuteTime = 0;
+			if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable)
+			{
+				eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_OUT_REQ_ID);//发送退出静音
+			}
+		}
+
+		if (eventInterWhatEventOn(pCollexBTInfo,EVENT_GLOBAL_SLEEP_PROC_BT_ID))
+		{
+			eventInterClrEvent(pCollexBTInfo,EVENT_GLOBAL_SLEEP_PROC_BT_ID);
+			if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeBTSleep
+				!= pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeBTSleep)
+			{
+				if (pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus)//切回手机
+				{
+					controlBTAudioTrans(pCollexBTInfo);
+				}
+				if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bRecWinCEFactoryMsg)
+				{
+					controlBTDeletePairedDevice(pCollexBTInfo);
+				}
+				//Sleep(1000);
+				pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeBTSleep
+					= pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeBTSleep;
+			}
+		}
+
+		if (eventInterWhatEventOn(pCollexBTInfo,EVENT_GLOBAL_STANDBY_BT_ID))
+		{
+			eventInterClrEvent(pCollexBTInfo,EVENT_GLOBAL_STANDBY_BT_ID);
+		}
+
+		if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bStandbyStatus)//电源控制
+		{
+			if (pCollexBTInfo->currentPower)
+			{
+				if (pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus)//切回手机
+				{
+					controlBTAudioTrans(pCollexBTInfo);
+				}
+				Sleep(100);
+				pCollexBTInfo->currentPower = FALSE;
+				controlBTPowerControl(pCollexBTInfo,FALSE);
+			}
+		}
+		else if (pCollexBTInfo->controlPower)
+		{
+			if (!pCollexBTInfo->currentPower)
+			{
+				pCollexBTInfo->currentPower = TRUE;
+				controlBTPowerControl(pCollexBTInfo,TRUE);
+			}
+		}
+		else if (!pCollexBTInfo->controlPower)
+		{
+			if (pCollexBTInfo->currentPower)
+			{
+				if (pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus)//切回手机
+				{
+					controlBTAudioTrans(pCollexBTInfo);
+				}
+				if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable)
+				{
+					if ('H' != pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)
+					{
+						eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_REQ_ID);//发送进入静音
+						while (!eventInterWhatEventOn(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_OK_ID))//等待OK
+						{
+							Sleep(100);
+						}
+						eventInterClrEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_IN_OK_ID);//清除
+					}
+				}
+
+				pCollexBTInfo->currentPower = FALSE;
+				controlBTPowerControl(pCollexBTInfo,FALSE);
+				Sleep(618);
+				if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable)
+				{
+					eventInterSetEvent(pCollexBTInfo,EVENT_GLOBAL_BT_MUTE_OUT_REQ_ID);//发送退出静音
+				}
+			}
+		}
+
+		if (pCollexBTInfo->bPower)//复位
+		{
+			if (!pCollexBTInfo->bPowerUp)
+			{
+				DBG1(RETAILMSG(1, (TEXT("\r\nCollex Reset")));)
+				collex_ChipEnableControl_On(pCollexBTInfo);
+	
+				collex_ResetControl_On(pCollexBTInfo);
+				collex_PowerControl_Off(pCollexBTInfo);
+				Sleep(100);
+				collex_PowerControl_On(pCollexBTInfo);
+				Sleep(100);
+				collex_ResetControl_Off(pCollexBTInfo);
+				Sleep(314);
+
+				pCollexBTInfo->bPowerUp = TRUE;
+			}
+		}
+
+		if (pCollexBTInfo->hBTComm && pCollexBTInfo->hBTComm != INVALID_HANDLE_VALUE && pCollexBTInfo->bPowerUp)//串口OK且蓝牙打开
+		{
+			if (!pCollexBTInfo->sCollexBTInfo.bWork)//查询蓝牙工作状态
+			{
+				controlBTReqVersion(pCollexBTInfo);
+				controlBTUseInnerMic(pCollexBTInfo,TRUE);
+			}
+			else//控制蓝牙复位
+			{
+				if (!pCollexBTInfo->bUpdater)//蓝牙死机的复位
+				{
+					if (GetTickCount() - pCollexBTInfo->iAutoResetControlTime >= 1000
+						&& GetTickCount() - pCollexBTInfo->iAutoResetControlTime < 10*1000)
+					{
+						controlBTReqVersion(pCollexBTInfo);
+					}
+					else if (GetTickCount() - pCollexBTInfo->iAutoResetControlTime >= 10*1000)
+					{
+						collex_ResetControl_On(pCollexBTInfo);
+						collex_PowerControl_Off(pCollexBTInfo);
+						Sleep(100);
+						collex_PowerControl_On(pCollexBTInfo);
+						Sleep(100);
+						collex_ResetControl_Off(pCollexBTInfo);
+						Sleep(314);
+						controlBTPowerControl(pCollexBTInfo,FALSE);
+						controlBTPowerControl(pCollexBTInfo,TRUE);
+					}
+				}
+			}
+			
+			if (pCollexBTInfo->sCollexBTInfo.iAudioConnectionStatusTime)
+			{
+				if (GetTickCount() - pCollexBTInfo->sCollexBTInfo.iAudioConnectionStatusTime > 618*3)
+				{
+					pCollexBTInfo->sCollexBTInfo.iAudioConnectionStatusTime = 0;
+
+					if ('A' == pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)
+					{
+						returnMobileAudioTransfer(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus);//根据蓝牙返回同步界面
+					}
+					else if ('H' == pCollexBTInfo->sCollexBTInfo.cMobileCallStatus)//这代码有问题
+					{
+						if (FALSE == pCollexBTInfo->sCollexBTInfo.bAudioConnectionStatus)
+						{
+							controlBTAudioTrans(pCollexBTInfo);					
+						}
+					}				
+				}
+			}
+
+			if (pCollexBTInfo->sCollexBTInfo._W_bPairing)//iPairedStatus 0初始化 1发送了清空 2发送了配对
+			{
+				if (pCollexBTInfo->sCollexBTInfo.bConnected)
+				{
+					controlConnectActiveMobilePhoneStatus(pCollexBTInfo,FALSE);
+				}
+				else if (pCollexBTInfo->sCollexBTInfo.bPaired)
+				{
+					controlBTDeletePairedDevice(pCollexBTInfo);//删除之前的配对信息
+				}
+				else if (pCollexBTInfo->sCollexBTInfo.iPairedStatus == 0)
+				{
+					controlBTDeletePairedDevice(pCollexBTInfo);//删除之前的配对信息
+					pCollexBTInfo->sCollexBTInfo.iPairedStatus = 1;
+				}
+				else if (pCollexBTInfo->sCollexBTInfo.iPairedStatus == '0')
+				{
+					pCollexBTInfo->sCollexBTInfo._W_bPairing = FALSE;
+					//返回需要配对状态 
+					returnMobilePairStatus(pCollexBTInfo,TRUE);
+				}
+				else
+				{
+					if (pCollexBTInfo->sCollexBTInfo.iPairedStatus != 'R'
+						&& pCollexBTInfo->sCollexBTInfo.iPairedStatus != '1')//新蓝牙模块，某个手机的问题
+					{
+						if (pCollexBTInfo->sCollexBTInfo.iPairedStatus != 2)
+						{
+							controlBTPair(pCollexBTInfo);
+							pCollexBTInfo->sCollexBTInfo.iPairedStatus = 2;//表示已发送
+						}
+					}
+				}
+			}
+			if (pCollexBTInfo->sCollexBTInfo.bConnected)
+			{
+				if (0 == pCollexBTInfo->sCollexBTInfo.iDeviceNameLength)
+				{
+					controlBTReqMobileName(pCollexBTInfo);
+				}
+				else if (pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn)//需要返回电话本
+				{
+					DBG2(RETAILMSG(1, (TEXT("\r\nThreadCollexBTMainProc need return phonebook")));)
+						//if (pCollexBTInfo->sCollexBTInfo._W_iPhoneListType == pCollexBTInfo->sCollexBTInfo.iPhoneListType)
+						if (pCollexBTInfo->sCollexBTInfo._W_iPhoneListType >= '1'
+							&& pCollexBTInfo->sCollexBTInfo._W_iPhoneListType <= '6')//返回某个电话本
+						{
+							DBG2(RETAILMSG(1, (TEXT(" curCount %d,needCount %d, startCount %d, totalCount %d")
+								,pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent
+								,pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount
+								,pCollexBTInfo->sCollexBTInfo.iPhoneListStart
+								,phoneListGetSelectCount(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType)));)
+								while (pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent != pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount)//没有返回足够数量
+								{
+									RETAILMSG(1, (TEXT(" needreturnmore")));
+									if (0 == pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent)//每页开始返回时
+									{
+										UINT iSelectCount = phoneListGetSelectCount(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType);
+										if (pCollexBTInfo->sCollexBTInfo.iPhoneListStart >= iSelectCount)//判断是否超过
+										{
+											if (pCollexBTInfo->sCollexBTInfo.iPhoneListStart)//跳过全都没有的情况
+											{
+												pCollexBTInfo->sCollexBTInfo.iPhoneListStart = iSelectCount - 1;
+											}
+										}
+									}
+									P_COLLEX_BT_PHONE_LIST p;
+									p = phoneListGetSelectOne(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType,pCollexBTInfo->sCollexBTInfo.iPhoneListStart+pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent);
+									if (p)
+									{
+										DBG2(RETAILMSG(1, (TEXT(" index:%d"),pCollexBTInfo->sCollexBTInfo.iPhoneListStart+pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent));)
+											if (0 == pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent)//返回开始前刷新页面
+											{
+												returnBTPhoneBookPageFlush(pCollexBTInfo);
+											}
+											returnMobilePhoneList(pCollexBTInfo,p);
+											pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent++;
+									}
+									else
+									{
+										break;
+									}
+								}
+						}
+						pCollexBTInfo->sCollexBTInfo.bPhoneListStartReturn = FALSE;
+						if (pCollexBTInfo->sCollexBTInfo.bPhoneListNeedReturnFlush)
+						{
+							DBG2(RETAILMSG(1, (TEXT("NeedFlush RecFinish%d Max%d")
+								,pCollexBTInfo->sCollexBTInfo.bPhoneListPhoneReadFinish[pCollexBTInfo->sCollexBTInfo._W_iPhoneListType - '0']
+							,phoneListGetSelectCount(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType)));)
+
+								if (pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent == pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCount)
+								{
+									returnBTPhoneBookReadStatus(pCollexBTInfo,1);
+									pCollexBTInfo->sCollexBTInfo.bPhoneListNeedReturnFlush = FALSE;
+								}
+								else if (pCollexBTInfo->sCollexBTInfo.bPhoneListPhoneReadFinish[pCollexBTInfo->sCollexBTInfo._W_iPhoneListType - '0'])
+								{
+									if (pCollexBTInfo->sCollexBTInfo.iPhoneListStart+pCollexBTInfo->sCollexBTInfo.iPhoneListReturnCurrent
+										>= phoneListGetSelectCount(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType))
+									{
+										returnBTPhoneBookReadStatus(pCollexBTInfo,1);
+										pCollexBTInfo->sCollexBTInfo.bPhoneListNeedReturnFlush = FALSE;
+									}
+								}
+						}
+				}
+				else if (pCollexBTInfo->sCollexBTInfo._W_iPhoneListType != pCollexBTInfo->sCollexBTInfo.iPhoneListType)//电话本不匹配
+				{
+					if (0xFF != pCollexBTInfo->sCollexBTInfo.iPhoneListType)
+					{
+						controlBTSelectPhoneBook(pCollexBTInfo,pCollexBTInfo->sCollexBTInfo._W_iPhoneListType);
+					}
+				}
+			}
+			else
+			{
+				if (pCollexBTInfo->sCollexBTInfo.bWork)//尝试连接
+				{
+					if (pCollexBTInfo->sCollexBTInfo.bPaired && 'R' != pCollexBTInfo->sCollexBTInfo.iPairedStatus)//不是正在配对状态
+					{
+						controlConnectActiveMobilePhoneStatus(pCollexBTInfo,TRUE);
+					}
+				}
+			}
+		}
+	}
+	pCollexBTInfo->hCollexBTMainThread = NULL;
+	DBG1(RETAILMSG(1, (TEXT("\r\nThreadCollexBTMainProc exit")));)
+		return 0;
+}
+
+static VOID collexBT_Enable(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bEnable)
+{
+	if (bEnable)
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nCollexBT_Enable Enable!")));)
+
+			collex_PowerControl_Off(pCollexBTInfo);
+		collex_ChipEnableControl_On(pCollexBTInfo);
+		collex_ResetControl_On(pCollexBTInfo);
+
+		pCollexBTInfo->bKillCollexBTMainThread = FALSE;
+		DWORD dwThreadID;
+		pCollexBTInfo->hCollexBTMainThreadEvent = CreateEvent(NULL, FALSE, TRUE, DATA_GLOBAL_HANDLE_BT);	
+		pCollexBTInfo->hCollexBTMainThread = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL,0,
+			(LPTHREAD_START_ROUTINE)ThreadCollexBTMainProc, pCollexBTInfo,0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nThreadCollexBTMainProc ID:%x"),dwThreadID));)
+
+		if (NULL == pCollexBTInfo->hCollexBTMainThread)
+		{
+			pCollexBTInfo->bKillCollexBTMainThread = TRUE;
+			return;
+		}
+		openBTComm(pCollexBTInfo);
+	}
+	else
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nCollexBT_Enable Disable!")));)
+
+		if (pCollexBTInfo->sCollexBTInfo.bConnected)
+		{
+			//断开手机连接
+			pCollexBTInfo->sCollexBTInfo.bConnected = FALSE;
+			controlConnectActiveMobilePhoneStatus(pCollexBTInfo,FALSE);
+		}
+
+		pCollexBTInfo->bKillCollexBTMainThread = TRUE;
+		SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+		while (pCollexBTInfo->hCollexBTMainThread)
+		{
+			SetEvent(pCollexBTInfo->hCollexBTMainThreadEvent);
+			Sleep(10);
+		}
+
+		CloseHandle(pCollexBTInfo->hCollexBTMainThread);
+		pCollexBTInfo->hCollexBTMainThread = NULL;
+		pCollexBTInfo->hCollexBTMainThreadEvent = NULL;
+		closeBTComm(pCollexBTInfo);
+		collex_PowerControl_Off(pCollexBTInfo);
+	}
+}
+
+static VOID powerNormalDeInit(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	pCollexBTInfo->BTInfoFrameStatus = 0;
+
+	collexBTInfoInit(pCollexBTInfo,TRUE);
+	pCollexBTInfo->bPower = FALSE;
+	pCollexBTInfo->bPowerUp = FALSE;
+	collex_PowerControl_Off(pCollexBTInfo);
+	collex_ChipEnableControl_On(pCollexBTInfo);
+	collex_ResetControl_On(pCollexBTInfo);
+}
+
+static VOID powerNormalInit(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	pCollexBTInfo->buffToUserHx = 0;
+	pCollexBTInfo->buffToUserLx = 0;
+
+	pCollexBTInfo->BTInfoFrameStatus = 0;
+
+	pCollexBTInfo->iBTSelfReturnHandDownTime = 0;
+
+	collex_PowerControl_Off(pCollexBTInfo);
+	collex_ChipEnableControl_On(pCollexBTInfo);
+	collex_ResetControl_On(pCollexBTInfo);
+}
+
+static VOID powerOnFirstInit(P_FLY_COLLEX_BT_INFO pCollexBTInfo)
+{
+	pCollexBTInfo->bOpen = FALSE;
+	pCollexBTInfo->bPower = FALSE;
+	pCollexBTInfo->bSpecialPower = FALSE;
+	pCollexBTInfo->bPowerUp = FALSE;
+
+	pCollexBTInfo->bUpdater = FALSE;
+
+	pCollexBTInfo->bKillCollexBTMainThread = TRUE;
+	pCollexBTInfo->hCollexBTMainThread = NULL;
+	pCollexBTInfo->hCollexBTMainThreadEvent = NULL;
+
+	pCollexBTInfo->hBTComm = NULL;
+	pCollexBTInfo->bKillFlyBTCommThread = TRUE;
+	pCollexBTInfo->hThreadHandleFlyBTComm = NULL;
+	pCollexBTInfo->BTInfoFrameStatus = 0;
+
+	pCollexBTInfo->sCollexBTInfo.pBTPhoneList = NULL;
+	collexBTInfoInit(pCollexBTInfo,TRUE);
+
+	pCollexBTInfo->iControlAudioMuteTime = 0;
+	pCollexBTInfo->bControlAudioMuteLongTime = FALSE;
+}
+
+static VOID powerOnSpecialEnable(P_FLY_COLLEX_BT_INFO pCollexBTInfo,BOOL bOn)
+{
+	if (bOn)
+	{
+		if (pCollexBTInfo->bSpecialPower)
+		{
+			return;
+		}
+		pCollexBTInfo->bSpecialPower = TRUE;
+
+		pCollexBTInfo->hBuffToUserDataEvent = CreateEvent(NULL,FALSE,FALSE,NULL);	
+		InitializeCriticalSection(&pCollexBTInfo->hCSSendToUser);
+	} 
+	else
+	{
+		if (!pCollexBTInfo->bSpecialPower)
+		{
+			return;
+		}
+		pCollexBTInfo->bSpecialPower = FALSE;
+
+		collexBTInfoInit(pCollexBTInfo,TRUE);
+		CloseHandle(pCollexBTInfo->hBuffToUserDataEvent);
+	}
+}
+
+HANDLE
+FBT_Init(DWORD dwContext)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo;
+
+	RETAILMSG(1, (TEXT("\r\nCollex Init Start")));
+
+	// 加载驱动并取得函数指针数组的地址(存放了要引出的底层函数的指针)
+	pUDDApiTable = UDD_ConnectService();
+	if(SOC_Version_Check(SOC_DRV_VERSION) == FALSE)
+	{
+		DBG0(RETAILMSG(1, (TEXT("FlyAudio Global ERR SOC_Version_Check!\r\n")));)
+			// 错误处理
+	}
+	pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)LocalAlloc(LPTR, sizeof(FLY_COLLEX_BT_INFO));
+	if (!pCollexBTInfo)
+	{
+		return NULL;
+	}
+	//全局
+	pCollexBTInfo->pFlyDriverGlobalInfo = SOC_DriverGlobal_Get();
+
+	if (pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalStructSize
+		!= sizeof(FLY_DRIVER_GLOBAL))
+	{
+		pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[0] = 'F';
+		pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[1] = 'B';
+		pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[2] = 'T';
+	}
+
+	pCollexBTInfo->controlPower = FALSE;
+	pCollexBTInfo->currentPower = FALSE;
+
+	//参数初始化
+	powerNormalInit(pCollexBTInfo);
+	powerOnFirstInit(pCollexBTInfo);
+	powerOnSpecialEnable(pCollexBTInfo,TRUE);
+
+	pCollexBTInfo->hHandleGlobalGlobalEvent = CreateEvent(NULL,FALSE,FALSE,DATA_GLOBAL_HANDLE_GLOBAL);
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.bInit = TRUE;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.iDriverCompYear = year;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.iDriverCompMon = months;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.iDriverCompDay = day;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.iDriverCompHour = hours;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.iDriverCompMin = minutes;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.iDriverCompSec = seconds;
+
+	DBG2(RETAILMSG(1, (TEXT("\r\nCollexBT Init Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));)
+
+		pCollexBTInfo->xxxxxxxx = FALSE;
+
+		return (HANDLE)pCollexBTInfo;
+}
+
+BOOL
+FBT_Deinit(DWORD hDeviceContext)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)hDeviceContext;
+	DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT DeInit\r\n")));)
+
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.bInit = FALSE;
+	SetEvent(pCollexBTInfo->hHandleGlobalGlobalEvent);
+	CloseHandle(pCollexBTInfo->hHandleGlobalGlobalEvent);
+
+	powerOnSpecialEnable(pCollexBTInfo,FALSE);
+
+	LocalFree(pCollexBTInfo);
+	return TRUE;
+}
+
+DWORD
+FBT_Open(DWORD hDeviceContext, DWORD AccessCode, DWORD ShareMode)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)hDeviceContext;
+	DWORD returnWhat = hDeviceContext;
+
+	if (pCollexBTInfo->bOpen)
+	{
+		return NULL;	
+	}
+	pCollexBTInfo->bOpen = TRUE;
+	collexBT_Enable(pCollexBTInfo,TRUE);
+
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.bOpen = TRUE;
+
+	DBG0(RETAILMSG(1, (TEXT("\r\nCollexBT Open Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));)
+		return returnWhat;
+}
+
+BOOL
+FBT_Close(DWORD hDeviceContext)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)hDeviceContext;
+
+	pCollexBTInfo->bOpen = FALSE;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlyGlobalBTInfo.bOpen = FALSE;
+	collexBT_Enable(pCollexBTInfo,FALSE);
+
+	DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT Close\r\n")));)
+		return TRUE;
+}
+
+VOID
+FBT_PowerUp(DWORD hDeviceContext)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)hDeviceContext;
+
+	powerNormalInit(pCollexBTInfo);
+
+	DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT PowerUp!\r\n")));)
+}
+
+VOID
+FBT_PowerDown(DWORD hDeviceContext)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)hDeviceContext;
+
+	powerNormalDeInit(pCollexBTInfo);
+
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeBTSleep = FALSE;
+	pCollexBTInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeBTSleep = FALSE;
+
+	DBG0(RETAILMSG(1, (TEXT("FlyAudio CollexBT PowerDown!\r\n")));)
+}
+
+DWORD
+FBT_Read(DWORD hOpenContext, LPVOID pBuffer, DWORD Count)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)hOpenContext;
+
+	UINT dwRead = 0;
+	BYTE *SendBuf = (BYTE *)pBuffer;
+
+	while(dwRead < Count && pCollexBTInfo->buffToUserLx != pCollexBTInfo->buffToUserHx)
+	{
+		SendBuf[dwRead++] = pCollexBTInfo->buffToUser[pCollexBTInfo->buffToUserLx++];
+		if (pCollexBTInfo->buffToUserLx >= DATA_BUFF_LENGTH)
+		{
+			pCollexBTInfo->buffToUserLx = 0;
+		}
+	}
+	if(pCollexBTInfo->buffToUserLx != pCollexBTInfo->buffToUserHx)
+	{
+		SetEvent(pCollexBTInfo->hBuffToUserDataEvent);
+	}
+	return dwRead;
+}
+
+DWORD
+FBT_Write(DWORD hOpenContext, LPCVOID pSourceBytes, DWORD NumberOfBytes)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)hOpenContext;
+	DBG2(RETAILMSG(1, (TEXT("\r\nCollexBT Write %d "),
+		NumberOfBytes));)
+		for(UINT i = 0;i < NumberOfBytes;i++)
+		{
+			DBG2(RETAILMSG(1, (TEXT(" %X"),
+				*((BYTE *)pSourceBytes + i)));)
+		}
+		if(NumberOfBytes)
+		{
+			WinCECommandProcessor(pCollexBTInfo,(((BYTE *)pSourceBytes)+3),((BYTE *)pSourceBytes)[2]);
+		}
+		return NULL;
+}
+
+DWORD
+FBT_Seek(DWORD hOpenContext, LONG Amount, DWORD  Type)
+{
+	return NULL;
+}
+
+BOOL
+FBT_IOControl(DWORD hOpenContext,
+			  DWORD dwCode, PBYTE pBufIn, DWORD dwLenIn,
+			  PBYTE pBufOut, DWORD dwLenOut, PDWORD pdwActualOut)
+{
+	P_FLY_COLLEX_BT_INFO pCollexBTInfo = (P_FLY_COLLEX_BT_INFO)hOpenContext;
+	BOOL bRes = TRUE;
+
+	if (dwCode != IOCTL_SERIAL_WAIT_ON_MASK)
+	{
+		DBG1(RETAILMSG(1, (TEXT("\r\nCollex IOControl(h:0x%X, Code:%X, IN:0x%X, %d, OUT:0x%X, %d, ActOut:0x%X)"),
+			hOpenContext, dwCode, pBufIn, dwLenIn, pBufOut, dwLenOut, pdwActualOut));)
+	}
+
+	switch (dwCode)
+	{
+	case IOCTL_SERIAL_SET_WAIT_MASK:
+		DBG1(RETAILMSG(1, (TEXT("\r\nCollex IOControl Set IOCTL_SERIAL_SET_WAIT_MASK")));)
+			break;
+	case IOCTL_SERIAL_WAIT_ON_MASK:
+		//DBG1(RETAILMSG(1, (TEXT("\r\nParrot IOControl Set IOCTL_SERIAL_WAIT_ON_MASK")));)
+		if (pCollexBTInfo->bOpen)
+		{
+			WaitForSingleObject(pCollexBTInfo->hBuffToUserDataEvent,INFINITE);
+		} 
+		else
+		{
+			WaitForSingleObject(pCollexBTInfo->hBuffToUserDataEvent,0);
+		}
+		if ((dwLenOut < sizeof(DWORD)) || (NULL == pBufOut) ||
+			(NULL == pdwActualOut))
+		{
+			bRes = FALSE;
+			break;
+		}
+		*(DWORD *)pBufOut = EV_RXCHAR;
+		*pdwActualOut = sizeof(DWORD);
+		break;
+	default :
+		break;
+	}
+
+	return TRUE;
+}
+
+BOOL
+DllEntry(
+		 HINSTANCE hinstDll,
+		 DWORD dwReason,
+		 LPVOID lpReserved
+		 )
+{
+	if (dwReason == DLL_PROCESS_ATTACH)
+	{
+		DEBUGMSG(1, (TEXT("Attach in Collex DllEntry\n")));
+		DisableThreadLibraryCalls((HMODULE)hinstDll);
+	}
+
+	if (dwReason == DLL_PROCESS_DETACH)
+	{
+		DEBUGMSG(1, (TEXT("Dettach in Collex DllEntry\n")));
+	}
+
+	DEBUGMSG(1, (TEXT("Leaving Collex DllEntry\n")));
+
+	return (TRUE);
+}

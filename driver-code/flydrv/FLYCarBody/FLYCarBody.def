@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FLYCarBody
+
+EXPORTS FCB_Init
+	FCB_Deinit
+	FCB_Open
+	FCB_Close
+	FCB_Read
+	FCB_Write
+	FCB_Seek
+	FCB_PowerDown
+	FCB_PowerUp
+	FCB_IOControl

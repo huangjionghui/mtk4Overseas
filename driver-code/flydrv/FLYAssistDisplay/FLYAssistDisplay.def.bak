@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FLYAssistDisplay
+
+EXPORTS FED_Init
+	FED_Deinit
+	FED_Open
+	FED_Close
+	FED_Read
+	FED_Write
+	FED_Seek
+	FED_PowerDown
+	FED_PowerUp
+	FED_IOControl

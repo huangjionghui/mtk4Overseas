@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FlyCollex
+
+EXPORTS FBT_Init
+	FBT_Deinit
+	FBT_Open
+	FBT_Close
+	FBT_Read
+	FBT_Write
+	FBT_Seek
+	FBT_PowerDown
+	FBT_PowerUp
+	FBT_IOControl

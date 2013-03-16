@@ -1,0 +1,40 @@
+TARGETNAME=FLYKEY
+FILE_VIEW_ROOT_FOLDER= \
+    ReadMe.txt \
+    FLYKey.def \
+
+FILE_VIEW_RESOURCE_FOLDER= \
+
+FILE_VIEW_INCLUDES_FOLDER= \
+    FLYKey.h \
+
+SOURCES= \
+    FLYKey.cpp \
+    FLYKeyADC.cpp \
+
+RELEASETYPE=PLATFORM
+TARGETTYPE=DYNLINK
+CDEFINES=$(CDEFINES) -DFLYKEY_EXPORTS
+
+CDEFINES=$(CDEFINES) -DFLYAUDIO_RELEASE
+
+
+INCLUDES= \
+    $(INCLUDES);$(_TARGETPLATROOT)\SRC\arm2\inc;\
+	$(_TARGETPLATROOT)\SRC\inc\flyinc;\
+	
+TARGETLIBS= \
+  $(_COMMONSDKROOT)\lib\$(_CPUINDPATH)\coredll.lib \
+  $(_COMMONOAKROOT)\lib\$(_CPUINDPATH)\ceddk.lib \
+  $(_PLATCOMMONLIB)\$(_CPUINDPATH)\os_adaption_layer.lib\
+  $(_PLATCOMMONLIB)\$(_CPUINDPATH)\gpio_mt3360_mtk_v1.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyhwlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyshmlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flysocketlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyuserlib.lib \
+  $(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\winsock.lib \
+  $(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\ws2.lib \
+
+SOURCELIBS= \
+  $(_PLATCOMMONLIB)\$(_CPUDEPPATH)\auxadc_mt3360_v1.lib \
+

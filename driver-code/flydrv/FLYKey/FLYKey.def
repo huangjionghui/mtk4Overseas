@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FlyKey
+
+EXPORTS FKY_Init
+	FKY_Deinit
+	FKY_Open
+	FKY_Close
+	FKY_Read
+	FKY_Write
+	FKY_Seek
+	FKY_PowerDown
+	FKY_PowerUp
+	FKY_IOControl

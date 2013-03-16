@@ -1,0 +1,684 @@
+
+#include <windows.h>
+#include <ddraw.h>
+
+#include "tvd_drv_if.h"
+
+#include "fsc_surface.h"
+#include "fsc_tvd.h"
+
+
+
+/******************************
+*
+*   MACRO DECLARE
+*
+*****************************/
+
+
+
+#define MAX_TVD_IOCTL_PARA_LENGTH	    256
+
+#define LISTEN_STAT_THREAD_PRIORITY	    200
+#define SURFACE_FLIP_THREAD_PRIORITY	150
+
+
+#define x_memcpy     memcpy
+#define x_memset     memset
+
+
+#undef VERIFY
+
+#define VERIFY(x)		do { \
+	if (!(x))	{\
+	RETAILMSG(1, (TEXT("[FAST CAM TVD]DBGCHK Failed: %s, %d!\r\n"), TEXT(__FILE__), (INT32)__LINE__)); \
+	ASSERT(0);}\
+	} while (0)
+
+
+/******************************
+*
+*   GLOBAL VARABLE DECLARE
+*
+*****************************/
+enum
+{
+	TVD_EVT_ID_SIG_STATE = 0,
+	TVD_EVT_ID_FRAME_DONE, 
+	TVD_EVT_ID_MAX
+};
+		
+#define TVD_EVT_ID_CNT  		 (TVD_EVT_ID_MAX)
+
+TCHAR szTvdEvtName[TVD_EVT_ID_CNT][TVD_EVT_NAME_MAX_LENGTH] =
+{
+	_T("TVDSIGSTAT_BC"),
+	_T("TVDFRMDONE_BC")
+};
+
+static HANDLE         g_TVDEvtGroup[TVD_EVT_ID_CNT] = {0};
+static VDO_BUF_INFO_T g_VdoBufInfo[TVD_VDO_BUF_CNT] = {0};
+
+static HANDLE      	  g_hTvdListenThread            = NULL;
+static HANDLE         g_hFlipThread                 = NULL;
+static BOOL           g_TvdListenThreadExit         = TRUE;
+static BOOL           g_FlipSurfaceThreadExit       = TRUE;
+static HANDLE         g_hTvdDrv                     = NULL;
+static BOOL           g_FscTvdInited                = FALSE;
+static BOOL           g_fgSurfaceCreated            = FALSE;
+BOOL                  g_fgFreeVdoBuf                = FALSE;
+
+static HWND           g_hAppWnd                     = NULL;
+
+
+enum 
+{
+	TVD_STAT_STOP,
+	TVD_STAT_INIT,
+	TVD_STAT_CONFIG,
+	TVD_STAT_SHOW,
+	TVD_STAT_SUSPEND
+};
+
+DWORD         g_dwVdoFrameWidth               = NTSC_FRAME_WIDTH;
+DWORD         g_dwVdoFrameHeight              = NTSC_FRAME_HEIGHT;
+
+static UINT32 g_FscSyncTvdStat              = TVD_STAT_STOP;
+
+UINT8   TVDIoctlInBuff[MAX_TVD_IOCTL_PARA_LENGTH];
+
+TVD_DRV_CAMERA_PREVIEW_INIT_INFO_T g_TvdDrvInitPara;
+TVD_DRV_CAMERA_PREVIEW_CFG_T       g_TvdDrvCfgPara;
+
+TVD_CVBSIN_SIGNAL_STAT_T           g_TvdSigOn = {0};
+
+static BOOL g_FirstSigOn = FALSE;
+UINT16 g_delay = 0;// 1
+
+BOOL _InitFlipThread(VOID);
+
+
+static BOOL _TvdControl(UINT32 CtrlCode)
+{
+	UINT32 ErrorCode = ERROR_NONE;
+
+	PTVD_CTRL_T pTvdCtrlPara = (PTVD_CTRL_T) TVDIoctlInBuff;
+
+	pTvdCtrlPara->AppId     = TVD_APP_ID_CAMERA_PREVIEW;
+	pTvdCtrlPara->CtrlCode  = CtrlCode;
+	pTvdCtrlPara->pCtrlPara = (UINT8 *) (&TVDIoctlInBuff[sizeof(TVD_CTRL_T)]);
+
+	RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD] Control Tvd Driver : CtrlCode is %d  \r\n"), CtrlCode));
+
+	if (CtrlCode == TVD_CONTROL_CODE_STOP)
+	{
+		pTvdCtrlPara->CtrlParaLen = 0;
+
+		RETAILMSG(1, (L"[TVD_TEST] Control Tvd Driver : Stop  \r\n"));
+
+		x_memcpy(pTvdCtrlPara->pCtrlPara, &g_fgFreeVdoBuf, sizeof(BOOL));
+
+		ErrorCode = DeviceIoControl(g_hTvdDrv, IOCTL_TVD_CVBSIN_CONTROL, pTvdCtrlPara, sizeof(TVD_CTRL_T),
+			NULL, 0, NULL, NULL);
+
+		g_FscSyncTvdStat = TVD_STAT_STOP;
+	}
+
+	if ((CtrlCode == TVD_CONTROL_CODE_INIT) && (g_FscSyncTvdStat != TVD_STAT_INIT))
+	{
+		VDO_BUF_INFO_T  rVdoBufInfo[TVD_VDO_BUF_CNT] = {0};
+		UINT32       u4CfgBufSize = TVD_VDO_BUF_CNT * sizeof(VDO_BUF_INFO_T), u4RetSize = 0;
+
+		pTvdCtrlPara->CtrlParaLen = sizeof(TVD_DRV_CAMERA_PREVIEW_INIT_INFO_T);
+
+		if (pTvdCtrlPara->CtrlParaLen > (MAX_TVD_IOCTL_PARA_LENGTH - sizeof(TVD_CTRL_T)))
+		{
+			ASSERT(0);
+
+			return (FALSE);
+		}
+
+		RETAILMSG(1, (L"[FAST_CAMERA-TVD] Control Tvd Driver : Init  \r\n"));
+
+#if (FNR_ST_SOLUTION == FNR_ST_WCH)
+        g_TvdDrvInitPara.u4VdoBufCnt4Wch = 0;
+#endif
+		g_TvdDrvInitPara.u4VdoBufCnt = TVD_VDO_BUF_CNT;
+		g_TvdDrvInitPara.eVdoInFmt   = TVD_VDOFMT_YUV444;
+		g_TvdDrvInitPara.eVdoOutFmt  = TVD_VDOFMT_YUV420;
+		
+#if (SUPPORT_CONFIG_CVBSIN_IF)
+ 		g_TvdDrvInitPara.u4CHACvbsInxP = CVBSIN_1P;
+ 		g_TvdDrvInitPara.u4CHBCvbsInxP = CVBSIN_NONE;
+ 		g_TvdDrvInitPara.u4CHAOutDest  = TVD_CFG_OUT_DRAM;
+ 		g_TvdDrvInitPara.u4CHBOutDest  = TVD_CFG_OUT_NONE;
+#endif
+#if (ENSURE_BANK_ALIMENT)
+		g_TvdDrvInitPara.u4VdoBufAllocPolicy = TVD_BUF_POLICY_ALLOC;
+#endif
+		_tcscpy(g_TvdDrvInitPara.szSigStateEvtName, szTvdEvtName[TVD_EVT_ID_SIG_STATE]);
+		_tcscpy(g_TvdDrvInitPara.szFrameDoneEvtName, szTvdEvtName[TVD_EVT_ID_FRAME_DONE]);
+
+		x_memcpy(pTvdCtrlPara->pCtrlPara, &g_TvdDrvInitPara, sizeof(TVD_DRV_CAMERA_PREVIEW_INIT_INFO_T));
+
+		ErrorCode = DeviceIoControl( g_hTvdDrv,IOCTL_TVD_CVBSIN_CONTROL, pTvdCtrlPara, MAX_TVD_IOCTL_PARA_LENGTH,
+			rVdoBufInfo, u4CfgBufSize, (LPDWORD)&u4RetSize, NULL );
+
+		//Get the Vdo buffer information from tvd driver.
+		if (0 != ErrorCode)
+		{
+			if (u4RetSize == u4CfgBufSize)
+			{
+				x_memcpy(g_VdoBufInfo, rVdoBufInfo, u4CfgBufSize);
+
+
+				for (INT32 i = 0; i < TVD_VDO_BUF_CNT; i ++)
+					RETAILMSG(1,(TEXT("Buf %d PhyYAddr: 0x%x,dwVirYAddr: 0x%x,dwPhyCAddr: 0x%x,dwVirCAddr: 0x%x\r\n"),i, 
+					g_VdoBufInfo[i].dwPhyYAddr,g_VdoBufInfo[i].dwVirYAddr,
+					g_VdoBufInfo[i].dwPhyCAddr,g_VdoBufInfo[i].dwVirCAddr));
+			}
+			else
+			{
+				ASSERT(0);
+
+				return (FALSE);
+			}
+		}
+		else
+		{
+			RETAILMSG(1, (L"[FAST_CAMERA-TVD] Control Tvd Driver : Init  fail\r\n"));
+
+			return (FALSE);
+		}
+
+		g_FscSyncTvdStat = TVD_STAT_INIT;
+	}
+
+	if (CtrlCode & TVD_CONTROL_CODE_CONFIG)
+	{
+		if( (CtrlCode & TVD_CONTROL_CODE_CONFIG) && (g_FscSyncTvdStat == TVD_STAT_CONFIG))
+		{
+			return (FALSE);
+		}
+
+		RETAILMSG(1, (L"[FAST_CAMERA-TVD] Control Tvd Driver : Config  \r\n"));
+
+		pTvdCtrlPara->CtrlParaLen = sizeof(TVD_DRV_CAMERA_PREVIEW_CFG_T);
+
+		if (pTvdCtrlPara->CtrlParaLen > (MAX_TVD_IOCTL_PARA_LENGTH - sizeof(TVD_CTRL_T)))
+		{
+			ASSERT(0);
+		}
+
+		x_memcpy(pTvdCtrlPara->pCtrlPara, &g_TvdDrvCfgPara, sizeof(TVD_DRV_CAMERA_PREVIEW_CFG_T));
+
+		ErrorCode = DeviceIoControl(g_hTvdDrv,IOCTL_TVD_CVBSIN_CONTROL, pTvdCtrlPara,
+			MAX_TVD_IOCTL_PARA_LENGTH, NULL, 0, NULL, NULL);
+
+		g_FscSyncTvdStat = TVD_STAT_CONFIG;
+
+	}
+
+	if (CtrlCode & TVD_CONTROL_CODE_START)
+	{
+		if( (CtrlCode & TVD_CONTROL_CODE_START) && (g_FscSyncTvdStat == TVD_STAT_SHOW) )
+		{
+			return (FALSE);
+		}
+
+		RETAILMSG(1, (L"[FAST_CAMERA-TVD] Control Tvd Driver : Start \r\n"));
+
+		pTvdCtrlPara->CtrlParaLen = 0;
+		pTvdCtrlPara->pCtrlPara = NULL;
+
+		ErrorCode = DeviceIoControl(g_hTvdDrv ,IOCTL_TVD_CVBSIN_CONTROL, pTvdCtrlPara,
+			sizeof(TVD_CTRL_T), NULL, 0, NULL, NULL);
+
+		g_FscSyncTvdStat = TVD_STAT_SHOW;
+	}
+
+	return (ErrorCode > 0);
+}	/* TvdControl() */
+
+static BOOL  _TvdGlobalEvtInit(VOID)
+{
+	UINT32 i = 0;
+
+	if(g_TVDEvtGroup[TVD_EVT_ID_SIG_STATE] == NULL)
+	{
+		g_TVDEvtGroup[TVD_EVT_ID_SIG_STATE] = 
+			CreateEvent(NULL, FALSE, FALSE, szTvdEvtName[TVD_EVT_ID_SIG_STATE]);
+	}
+	if (NULL == g_TVDEvtGroup[TVD_EVT_ID_SIG_STATE])
+	{
+		RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD] Fail to create tvd image signal state event \r\n")));
+		goto Error;
+	}
+
+	if(g_TVDEvtGroup[TVD_EVT_ID_FRAME_DONE] == NULL)
+	{
+		g_TVDEvtGroup[TVD_EVT_ID_FRAME_DONE] = 
+			CreateEvent(NULL, FALSE, FALSE, szTvdEvtName[TVD_EVT_ID_FRAME_DONE]);
+	}
+	if (NULL == g_TVDEvtGroup[TVD_EVT_ID_FRAME_DONE])
+	{
+		RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD] Fail to create tvd frame done event \r\n")));
+		goto Error;
+	}
+
+	return (TRUE);
+
+Error:
+	RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD]Init tvd global event error! \r\n")));
+
+	return (FALSE);
+}/* TvdGlobalEvtInit() */
+
+
+
+static BOOL _TvdDrvOpen()
+{
+	if(NULL == g_hTvdDrv)
+	{
+		g_hTvdDrv = CreateFile(TVD_DRIVER_NAME, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	}
+
+	if (INVALID_HANDLE_VALUE == g_hTvdDrv)
+	{
+		RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD] Fail to open Tvd driver, ErrorCode: %d\r\n"),GetLastError()));
+
+		return (FALSE);
+	}
+
+	return (TRUE);
+}/* TvdDrvOpen() */
+
+
+
+
+BOOL OnImgSignalLoss(UINT32 u4EvtData)
+{
+	RETAILMSG(1,(TEXT("-------Loss Image Signal-----\r\n")));
+
+	if (g_FscSyncTvdStat == TVD_STAT_STOP || g_FscSyncTvdStat == TVD_STAT_INIT)
+	{
+		return (TRUE);
+	}
+	
+	VERIFY(HideBackCarVideoOverlay());
+    VERIFY(DestroyBackCarVideoSurfaces());
+	
+ 	
+ 	  
+	return (TRUE);
+}
+
+
+BOOL OnImgSignalGet(UINT32 u4EvtData)
+{
+	RETAILMSG(1,(TEXT("-------Get Image Signal-----\r\n")));
+	
+   if(g_FscSyncTvdStat  == TVD_STAT_STOP)
+   	   return TRUE;
+	
+	switch (u4EvtData)
+	{
+	case AV_MODE_PAL:
+		{
+			g_FirstSigOn = TRUE;
+			g_dwVdoFrameWidth  = PAL_FRAME_WIDTH;
+			g_dwVdoFrameHeight = PAL_FRAME_HEIGHT;
+			RETAILMSG(1, (TEXT("-------CVBS signal system is PAL-----\r\n")));
+		}
+		break;
+	case AV_MODE_NTSC:
+		{
+			g_FirstSigOn = TRUE;
+			g_dwVdoFrameWidth  = NTSC_FRAME_WIDTH;
+			g_dwVdoFrameHeight = NTSC_FRAME_HEIGHT;
+			RETAILMSG(1, (TEXT("-------CVBS signal system is NTSC-----\r\n")));
+		}
+		break;
+	case AV_MODE_SECAM:
+		{
+			g_dwVdoFrameWidth  = SECAM_FRAME_WIDTH;
+			g_dwVdoFrameHeight = SECAM_FRAME_HEIGHT;
+			RETAILMSG(1, (TEXT("-------CVBS signal system is SECAM-----\r\n")));
+		}
+		break;
+	case AV_MODE_UNSTABLE:
+	case AV_MODE_NONE:
+		RETAILMSG(1, (TEXT("-------OnImgSignalGet Error CVBS signal system value-----\r\n")));
+		break;
+	}
+
+
+	VERIFY(CreateBackCarSurfaces(g_hAppWnd, g_VdoBufInfo, TVD_VDO_BUF_CNT));
+
+	VERIFY(_InitFlipThread());
+
+	g_TvdDrvCfgPara.u1HueLvl		= 0xFF;
+	g_TvdDrvCfgPara.u1SaturationLvl = 0xFF;
+	g_TvdDrvCfgPara.u1BrightnessLvl = 0xFF;
+	g_TvdDrvCfgPara.eMirrorCfg		= TVD_FLIP_NONE;
+
+	VERIFY(_TvdControl(TVD_CONTROL_CODE_CONFIG));
+
+	VERIFY(_TvdControl(TVD_CONTROL_CODE_START));
+
+	//ShowBackCarOverlay();
+
+	return (TRUE);
+}
+
+
+BOOL OnImgSysChange(UINT32 u4EvtData)
+{
+	RETAILMSG(1,(TEXT("-------Tv system changed-----\r\n")));
+	// _TvdControl(TVD_CONTROL_CODE_STOP);
+	return (TRUE);
+}
+
+
+
+DWORD WINAPI _TvdListenStatThread(LPVOID lpPara)
+{
+	DWORD dwWaitIdx = 0xFF;
+	DWORD dwEvtData = 0;
+
+	while(!g_TvdListenThreadExit)
+	{
+		WaitForSingleObject(g_TVDEvtGroup[TVD_EVT_ID_SIG_STATE], INFINITE);
+
+        dwEvtData = GetEventData(g_TVDEvtGroup[TVD_EVT_ID_SIG_STATE]);
+		
+		switch(dwEvtData & TVD_SIG_STATE_MASK)
+		{
+		case TVD_SIG_OFF_FLAG:	//ghTvdLossImageEvent
+			OnImgSignalLoss(0);
+			break;
+		case TVD_SIG_ON_FLAG:	//ghTvdGetImageEvent
+			OnImgSignalGet(dwEvtData & (~TVD_SIG_STATE_MASK));
+			break;
+		case TVD_MODE_CHANGE_FLAG: //ghTvdSysEvent
+			OnImgSysChange(dwEvtData & (~TVD_SIG_STATE_MASK));
+			break;
+		default: //error 
+			RETAILMSG(1,(TEXT("[FAST_CAMERA-TVD]***tvd error event!!***\n\r")));
+			break;
+		}
+
+		Sleep(0);
+	}
+
+	return 0;
+}
+
+BOOL _InitTvdListenStatThread(VOID)
+{
+	/* Create one SENSOR IST 	*/
+	//m_hCAMERAInterruptThread = NULL;
+
+	if(g_hTvdListenThread == NULL)
+	{
+		g_TvdListenThreadExit = FALSE;
+
+		g_hTvdListenThread = CreateThread(NULL,0,(LPTHREAD_START_ROUTINE)_TvdListenStatThread, NULL, 0, NULL);
+
+		if (NULL == g_hTvdListenThread)
+		{
+			RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD] Fail to create CAMERA loss image thread \r\n")));
+
+			return (FALSE);
+		}
+
+		if (CeSetThreadPriority(g_hTvdListenThread, LISTEN_STAT_THREAD_PRIORITY) == FALSE)
+		{
+			RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD]Fail to set tvd listen signal status thread priority as 200 \r\n")));
+
+			return (FALSE);
+		}
+	}
+
+	return (TRUE);
+}	/* _InitTvdListenStatThread() */
+
+
+
+VOID _SurfaceFlipThread(VOID)
+{
+	DWORD           dwEvtData = 0;
+	DDSURFACEDESC   ddsdSrc;    
+	VDO_BUF_INFO_T  SurfaceMemInfo = {0};
+    DWORD           dwBufIndex = 0;
+
+	while (!g_FlipSurfaceThreadExit)
+	{
+		x_memset(&ddsdSrc, 0, sizeof(ddsdSrc));
+		ddsdSrc.dwSize = sizeof(ddsdSrc);
+	
+		WaitForSingleObject(g_TVDEvtGroup[TVD_EVT_ID_FRAME_DONE], INFINITE);
+        dwEvtData = GetEventData(g_TVDEvtGroup[TVD_EVT_ID_FRAME_DONE]);
+        dwBufIndex = dwEvtData & 3;
+		if(g_FirstSigOn)
+		{
+			if(g_delay < 4)
+			{
+				//RETAILMSG(TRUE,(TEXT("Before Show Video Surface,g_delay is %d!\r\n"),g_delay));
+				g_delay++;
+				continue;
+			}    
+			else
+			{
+				ShowBackCarOverlay();
+				g_delay = 0;
+				g_FirstSigOn = FALSE;
+			}	
+		}
+		UpdateBackCarOverlay(&g_VdoBufInfo[dwBufIndex]);
+		//Temp solution for stable image display.
+		//break;
+	}
+
+}
+
+
+BOOL _InitFlipThread(VOID)
+{
+	/* Create one SENSOR IST 	*/
+	//m_hCAMERAInterruptThread = NULL;
+
+	if(g_hFlipThread == NULL)
+	{
+		g_FlipSurfaceThreadExit = FALSE;
+
+		g_hFlipThread = CreateThread(NULL,0,(LPTHREAD_START_ROUTINE)_SurfaceFlipThread, NULL, 0, NULL);
+
+		if (NULL == g_hFlipThread)
+		{
+			RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD] Fail to create surface flip thread \r\n")));
+
+			return (FALSE);
+		}
+
+		if (CeSetThreadPriority(g_hFlipThread, SURFACE_FLIP_THREAD_PRIORITY) == FALSE)
+		{
+			RETAILMSG(1, (TEXT("[FAST_CAMERA-TVD]Fail to set surface flip thread priority as 200 \r\n")));
+
+			return (FALSE);
+		}
+	}
+
+	return (TRUE);
+}	/* CAMERA_InitSigChangeThread() */
+BOOL  TvdPreInit(HWND hAppWnd)
+{
+	BOOL bRet = FALSE;
+	g_hAppWnd = hAppWnd;
+
+   	 bRet  = _TvdDrvOpen();
+	 if(!bRet)
+	 	goto EXIT;
+	 bRet  = _TvdGlobalEvtInit();
+	  if(!bRet)
+	 	goto EXIT;
+	  
+     bRet =  _InitTvdListenStatThread();
+	  if(!bRet)
+	 	goto EXIT;
+	  
+	 g_FscTvdInited = TRUE;
+EXIT:
+	 return bRet;
+  
+}
+
+BOOL TvdInit(HWND hAppWnd)
+{
+   g_delay = 0;
+   return (_TvdControl(TVD_CONTROL_CODE_INIT));
+}
+
+
+BOOL TvdConfig(VOID)
+{
+	if (g_FscTvdInited)
+	{
+		VERIFY(_TvdControl(TVD_CONTROL_CODE_CONFIG));
+
+		return TRUE;
+	}
+	else
+	{
+		RETAILMSG(1,(TEXT("[FAST_CAMERA-TVD] tvd has not initialized \r\n")));
+
+		return (FALSE);
+	}
+}
+
+BOOL TvdStart(VOID)
+{
+	if (g_FscTvdInited)
+	{
+		VERIFY(_TvdControl(TVD_CONTROL_CODE_START));
+
+		return TRUE;
+	}
+	else
+	{
+		RETAILMSG(1,(TEXT("[FAST_CAMERA-TVD] tvd has not initialized \r\n")));
+
+		return (FALSE);
+	}
+}
+
+
+BOOL TvdStop(BOOL fgFreeVdoBuf)
+{
+	if (g_FscTvdInited)
+	{
+	    g_fgFreeVdoBuf = fgFreeVdoBuf;
+		VERIFY(_TvdControl(TVD_CONTROL_CODE_STOP));
+
+		return TRUE;
+	}
+	else
+	{
+		RETAILMSG(1,(TEXT("[FAST_CAMERA-TVD] tvd has not initialized \r\n")));
+
+		return (FALSE);
+	}
+
+	return TRUE;
+}
+
+
+BOOL TvdSignalIsOn(VOID)
+{
+    if (g_FscTvdInited)
+	{
+		UINT32 ErrorCode = TRUE;
+
+	PTVD_CTRL_T pTvdCtrlPara = (PTVD_CTRL_T) TVDIoctlInBuff;
+
+	pTvdCtrlPara->AppId     = TVD_APP_ID_CAMERA_PREVIEW;
+	pTvdCtrlPara->CtrlCode  = 2;
+	pTvdCtrlPara->pCtrlPara = (UINT8 *) (&TVDIoctlInBuff[sizeof(TVD_CTRL_T)]);
+
+	RETAILMSG(1, (TEXT("[TVD_TEST] Control Tvd Driver : CtrlCode is Get Tvd Signal \r\n")));
+	
+
+        pTvdCtrlPara->CtrlParaLen = 0;
+		
+    
+        RETAILMSG(1, (L"[TVD_TEST] Control Tvd Driver : Get tvd signal status\r\n"));
+			
+        ErrorCode = DeviceIoControl(g_hTvdDrv, IOCTL_TVD_DEBUG_CONTROL, pTvdCtrlPara, sizeof(TVD_CTRL_T),
+	                               &g_TvdSigOn,  sizeof(TVD_CVBSIN_SIGNAL_STAT_T), NULL, NULL); 
+		
+		return (g_TvdSigOn.fgSigOn);
+	}
+	else
+	{
+		RETAILMSG(1,(TEXT("[TVD_TEST] tvd has not initialized \r\n")));
+
+		return (FALSE);
+	}
+
+	return (TRUE);
+
+}
+
+
+VOID TvdDeinit(VOID)
+{
+	INT32 i = TVD_EVT_ID_CNT;
+
+	RETAILMSG(1,(TEXT("[FAST_CAMERA-TVD] TvdDeinit \r\n")));
+
+	TvdStop(TRUE);
+
+	if (g_FscTvdInited)
+	{
+		g_TvdListenThreadExit   = TRUE;
+		g_FlipSurfaceThreadExit = TRUE;
+
+		if (g_hTvdDrv)
+		{
+			CloseHandle(g_hTvdDrv);
+			g_hTvdDrv = NULL;
+		}
+
+		do
+		{
+			i--;
+
+			if (g_TVDEvtGroup[i])
+			{
+				CloseHandle(g_TVDEvtGroup[i]);
+				g_TVDEvtGroup[i] = NULL;
+			}
+
+		} while(i);
+
+		if (g_hTvdListenThread)
+		{
+			CloseHandle(g_hTvdListenThread);
+
+			g_hTvdListenThread = NULL;
+		}
+
+		if (g_hFlipThread)
+		{
+			CloseHandle(g_hFlipThread);
+
+			g_hFlipThread = NULL;
+		}
+
+		g_fgSurfaceCreated = FALSE;
+
+		g_FscTvdInited = FALSE;
+	}
+}
+
+

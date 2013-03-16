@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FLY7741Radio
+
+EXPORTS FRA_Init
+	FRA_Deinit
+	FRA_Open
+	FRA_Close
+	FRA_Read
+	FRA_Write
+	FRA_Seek
+	FRA_PowerDown
+	FRA_PowerUp
+	FRA_IOControl

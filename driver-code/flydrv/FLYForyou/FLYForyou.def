@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FlyFouyou
+
+EXPORTS FCD_Init
+	FCD_Deinit
+	FCD_Open
+	FCD_Close
+	FCD_Read
+	FCD_Write
+	FCD_Seek
+	FCD_PowerDown
+	FCD_PowerUp
+	FCD_IOControl

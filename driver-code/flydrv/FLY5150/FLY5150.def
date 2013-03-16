@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FLY5150
+
+EXPORTS FVO_Init
+	FVO_Deinit
+	FVO_Open
+	FVO_Close
+	FVO_Read
+	FVO_Write
+	FVO_Seek
+	FVO_PowerDown
+	FVO_PowerUp
+	FVO_IOControl

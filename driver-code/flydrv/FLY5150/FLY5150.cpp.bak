@@ -1,0 +1,1176 @@
+// FLY5150.cpp : Defines the entry point for the DLL application.
+//
+
+#include <drvlib.h>
+#include <bspregmap.h>
+#include <oemintr.h>
+#include <oemdrvlib.h>
+#include <pegdser.h>
+#include "driver_global.h"
+
+#include "SOC_FuncDef.h"
+#include "SOC_Service.h"
+#include "FLY5150.h"
+PUDD_API_TABLE	  pUDDApiTable=NULL;
+
+//软件编译日期
+#define DIGIT(s, no) ((s)[no] - '0')
+
+const int hours = (10 * DIGIT(__TIME__, 0) + DIGIT(__TIME__, 1));
+const int minutes = (10 * DIGIT(__TIME__, 3) + DIGIT(__TIME__, 4));
+const int seconds = (10 * DIGIT(__TIME__, 6) + DIGIT(__TIME__, 7));
+/* WARNING: This will fail in year 10000 and beyond, as it assumes
+* that a year has four digits. */
+const int year = ( 1000 * DIGIT(__DATE__, 7)
+				  + 100 * DIGIT(__DATE__, 8)
+				  + 10 * DIGIT(__DATE__, 9)
+				  + DIGIT(__DATE__, 10));
+
+/*
+* Jan - 1
+* Feb - 2
+* Mar - 3
+* Apr - 4
+* May - 5
+* Jun - 6
+* Jul - 7
+* Aug - 8
+* Sep - 9
+* Oct - 10
+* Nov - 11
+* Dec - 12
+*/
+
+/* Use the last letter as primary "key" and middle letter whenever
+* two months end in the same letter. */
+const int months = (__DATE__[2] == 'b' ? 2 :
+					(__DATE__[2] == 'y' ? 5 :
+					(__DATE__[2] == 'l' ? 7 :
+					(__DATE__[2] == 'g' ? 8 :
+					(__DATE__[2] == 'p' ? 9 :
+					(__DATE__[2] == 't' ? 10 :
+					(__DATE__[2] == 'v' ? 11 :
+					(__DATE__[2] == 'c' ? 12 :
+					(__DATE__[2] == 'n' ?
+					(__DATE__[1] == 'a' ? 1 : 6) :
+					/* Implicit "r" */
+					(__DATE__[1] == 'a' ? 3 : 4))))))))));
+const int day = ( 10 * (__DATE__[4] == ' ' ? 0 : DIGIT(__DATE__, 4))
+				 + DIGIT(__DATE__, 5));
+//软件编译日期
+
+//Color
+
+#if A4_PLAT
+#define nCOLOR_L_N	((BYTE)(0x00))
+#define nCOLOR_M_N	((BYTE)(0x8A))
+#define nCOLOR_H_N	((BYTE)(0xFF))
+
+#define nCONTRAST_L_N	((BYTE)(0x3d))
+#define nCONTRAST_M_N	((BYTE)(0x5d))
+#define nCONTRAST_H_N	((BYTE)(0x7d))
+
+#define nBRIGHTNESS_L_N	((BYTE)(0x34))
+#define nBRIGHTNESS_M_N	((BYTE)(0x5A))
+#define nBRIGHTNESS_H_N	((BYTE)(0x74))
+
+#define nHUE_L_N	((BYTE)(0x30))
+#define nHUE_M_N	((BYTE)(0x00))	
+#define nHUE_H_N	((BYTE)(0xD0))
+#else
+#define nCOLOR_L_N	((BYTE)(0x00))
+#define nCOLOR_M_N	((BYTE)(0xE6))
+#define nCOLOR_H_N	((BYTE)(0xFF))
+
+#define nCONTRAST_L_N	((BYTE)(0x3d))
+#define nCONTRAST_M_N	((BYTE)(0x5d))//((BYTE)(0x80))
+#define nCONTRAST_H_N	((BYTE)(0x7d))//((BYTE)(0xB0))
+
+#define nBRIGHTNESS_L_N	((BYTE)(0x34))
+#define nBRIGHTNESS_M_N	((BYTE)(0x54))//((BYTE)(0x68))
+#define nBRIGHTNESS_H_N	((BYTE)(0x74))
+
+#define nHUE_L_N	((BYTE)(0x30))
+#define nHUE_M_N	((BYTE)(0x00))	
+#define nHUE_H_N	((BYTE)(0xD0))
+#endif
+
+BYTE sColor_N[COLOR_STEP_COUNT]	= 																											
+{nCOLOR_L_N
+,nCOLOR_L_N+(nCOLOR_M_N-nCOLOR_L_N)/5*1,nCOLOR_L_N+(nCOLOR_M_N-nCOLOR_L_N)/5*2
+,nCOLOR_L_N+(nCOLOR_M_N-nCOLOR_L_N)/5*3,nCOLOR_L_N+(nCOLOR_M_N-nCOLOR_L_N)/5*4
+,nCOLOR_M_N
+,nCOLOR_M_N+(nCOLOR_H_N-nCOLOR_M_N)/5*1,nCOLOR_M_N+(nCOLOR_H_N-nCOLOR_M_N)/5*2
+,nCOLOR_M_N+(nCOLOR_H_N-nCOLOR_M_N)/5*3,nCOLOR_M_N+(nCOLOR_H_N-nCOLOR_M_N)/5*4
+,nCOLOR_H_N};
+
+BYTE sContrast_N[COLOR_STEP_COUNT]	= 																											
+{nCONTRAST_L_N
+,nCONTRAST_L_N+(nCONTRAST_M_N-nCONTRAST_L_N)/5*1,nCONTRAST_L_N+(nCONTRAST_M_N-nCONTRAST_L_N)/5*2
+,nCONTRAST_L_N+(nCONTRAST_M_N-nCONTRAST_L_N)/5*3,nCONTRAST_L_N+(nCONTRAST_M_N-nCONTRAST_L_N)/5*4
+,nCONTRAST_M_N
+,nCONTRAST_M_N+(nCONTRAST_H_N-nCONTRAST_M_N)/5*1,nCONTRAST_M_N+(nCONTRAST_H_N-nCONTRAST_M_N)/5*2
+,nCONTRAST_M_N+(nCONTRAST_H_N-nCONTRAST_M_N)/5*3,nCONTRAST_M_N+(nCONTRAST_H_N-nCONTRAST_M_N)/5*4
+,nCONTRAST_H_N};
+
+BYTE sBrightness_N[COLOR_STEP_COUNT]	= 
+{nBRIGHTNESS_L_N
+,nBRIGHTNESS_L_N+(nBRIGHTNESS_M_N-nBRIGHTNESS_L_N)/5*1,nBRIGHTNESS_L_N+(nBRIGHTNESS_M_N-nBRIGHTNESS_L_N)/5*2
+,nBRIGHTNESS_L_N+(nBRIGHTNESS_M_N-nBRIGHTNESS_L_N)/5*3,nBRIGHTNESS_L_N+(nBRIGHTNESS_M_N-nBRIGHTNESS_L_N)/5*4
+,nBRIGHTNESS_M_N
+,nBRIGHTNESS_M_N+(nBRIGHTNESS_H_N-nBRIGHTNESS_M_N)/5*1,nBRIGHTNESS_M_N+(nBRIGHTNESS_H_N-nBRIGHTNESS_M_N)/5*2
+,nBRIGHTNESS_M_N+(nBRIGHTNESS_H_N-nBRIGHTNESS_M_N)/5*3,nBRIGHTNESS_M_N+(nBRIGHTNESS_H_N-nBRIGHTNESS_M_N)/5*4
+,nBRIGHTNESS_H_N};
+
+BYTE sHue_N[COLOR_STEP_COUNT]			= 
+{nHUE_L_N
+,nHUE_L_N-(nHUE_L_N-nHUE_M_N)/5*1,nHUE_L_N-(nHUE_L_N-nHUE_M_N)/5*2
+,nHUE_L_N-(nHUE_L_N-nHUE_M_N)/5*3,nHUE_L_N-(nHUE_L_N-nHUE_M_N)/5*4
+,nHUE_M_N
+,nHUE_H_N+(0x100-nHUE_H_N)/5*4,nHUE_H_N+(0x100-nHUE_H_N)/5*3
+,nHUE_H_N+(0x100-nHUE_H_N)/5*2,nHUE_H_N+(0x100-nHUE_H_N)/5*1
+,nHUE_H_N};
+
+VOID Fly5150Enable(P_FLY_5150_INFO p5150Info,BOOL bOn);
+VOID
+FVO_PowerUp(DWORD hDeviceContext);
+VOID
+FVO_PowerDown(DWORD hDeviceContext);
+
+static void powerNormalInit(P_FLY_5150_INFO p5150Info);
+
+static void eventInterSetEvent(P_FLY_5150_INFO p5150Info,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = TRUE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = GetTickCount();
+	LeaveCriticalSection(&p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	SetEvent(p5150Info->hHandleGlobalGlobalEvent);
+}
+
+static void eventInterClrEvent(P_FLY_5150_INFO p5150Info,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = FALSE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = 0;
+	LeaveCriticalSection(&p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+}
+
+static BOOL eventInterWhatEventOn(P_FLY_5150_INFO p5150Info,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat])
+	{
+		LeaveCriticalSection(&p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+		return TRUE;
+	}
+	LeaveCriticalSection(&p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	return FALSE;
+}
+
+#if A4_PLAT
+#define IO_4052VIDEOSWITCH_G	1
+#define IO_4052VIDEOSWITCH_I	3
+#else
+#define IO_4052VIDEOSWITCH_G	2
+#define IO_4052VIDEOSWITCH_I	17
+#endif
+
+static void Video_4052VideoSwitch_Init(P_FLY_5150_INFO p5150Info)
+{
+	SOC_IO_Output(IO_4052VIDEOSWITCH_G,IO_4052VIDEOSWITCH_I,0);
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 4052VideoSwitch Init")));
+}
+
+static void Video_4052VideoSwitch_AUXiPodNotBack(P_FLY_5150_INFO p5150Info)
+{
+	SOC_IO_Output(IO_4052VIDEOSWITCH_G,IO_4052VIDEOSWITCH_I,1);
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 4052VideoSwitch AUXiPodNotBack")));
+}
+
+static void Video_4052VideoSwitch_BackNotAUXiPod(P_FLY_5150_INFO p5150Info)
+{
+	SOC_IO_Output(IO_4052VIDEOSWITCH_G,IO_4052VIDEOSWITCH_I,0);
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 4052VideoSwitch BackNotAUXiPod")));
+}
+
+static void actualChangeVideoInput(P_FLY_5150_INFO p5150Info,PVIN_CONFIG p,VIN_CONFIG_CODE configWhat)
+{
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 Video Config Enable:%dBlack:%dChannel:%dWidth:%dHeight:%dStartx:%d,Starty:%d\r\nBri:%x,Cor:%x,Hue:%x,Cont:%x,Alpha:%x\r\nWhat:%d")
+		,p->enable,p->black,p->channel,p->width,p->height,p->pos_x,p->pos_y
+		,p->brightness,p->color,p->hue,p->contrast,p->alpha,configWhat));
+	SOC_VIN_Set(configWhat,p);
+}
+
+static VOID FlyPutToBuff(P_FLY_5150_INFO p5150Info,BYTE data)
+{
+	p5150Info->buffToUser[p5150Info->buffToUserHx++] = data;
+	if (p5150Info->buffToUserHx >= DATA_BUFF_LENGTH)
+	{
+		p5150Info->buffToUserHx = 0;
+	}
+	if (p5150Info->buffToUserHx == p5150Info->buffToUserLx)
+	{
+		RETAILMSG(1, (TEXT("\r\n\r\n\r\nFlyAudio 5150 Buff to user overflow!!!\r\n\r\n\r\n")));
+	}
+}
+
+static VOID FlyReturnToUser(P_FLY_5150_INFO p5150Info,BYTE *buf,UINT len)
+{
+	BYTE crc;
+	UINT i;
+	EnterCriticalSection(&p5150Info->hCSSendToUser);
+	FlyPutToBuff(p5150Info,0xFF);
+	FlyPutToBuff(p5150Info,0x55);
+	FlyPutToBuff(p5150Info,len+1);
+	crc = len + 1;
+	for(i = 0;i < len;i++)
+	{
+		FlyPutToBuff(p5150Info,buf[i]);
+		crc += buf[i];
+	}
+	FlyPutToBuff(p5150Info,crc);
+	LeaveCriticalSection(&p5150Info->hCSSendToUser);
+	SetEvent(p5150Info->hBuffToUserDataEvent);
+}
+
+void returnVideoPowerMode(P_FLY_5150_INFO p5150Info,BYTE bPower)
+{
+	BYTE buff[] = {0x01,0x00};
+	buff[1] = bPower;
+
+	FlyReturnToUser(p5150Info,buff,2);
+}
+
+void returnVideoWorkMode(P_FLY_5150_INFO p5150Info,BYTE bWork)
+{
+	BYTE buff[] = {0x02,0x00};
+	buff[1] = bWork;
+
+	FlyReturnToUser(p5150Info,buff,2);
+}
+
+void returnDisplayValue(P_FLY_5150_INFO p5150Info,setDisplay enumWhat,BYTE iValue)
+{
+	BYTE buff[3] = {0x11,0x00,0x00};
+	
+	buff[1] = enumWhat;
+	buff[2] = iValue;
+
+	FlyReturnToUser(p5150Info,buff,3);
+}
+
+static DWORD WINAPI ThreadMain(LPVOID pContext)
+{
+	P_FLY_5150_INFO p5150Info = (P_FLY_5150_INFO)pContext;
+	ULONG waitTime = 0;
+
+	p5150Info->bPowerUp = TRUE;
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 ThreadMain Start")));
+
+	while (!p5150Info->bKillDispatchFlyMainThread)
+	{
+		if (0 == waitTime)
+		{
+			WaitForSingleObject(p5150Info->hDispatchMainThreadEvent, INFINITE);
+		} 
+		else
+		{
+			WaitForSingleObject(p5150Info->hDispatchMainThreadEvent, waitTime);
+		}
+		DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 ThreadMain Running bNeed %d bHave %d WaitTime %d")
+			,p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeVideoSleep
+			,p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep
+			,waitTime));)
+
+			waitTime = 0;
+
+
+		if (eventInterWhatEventOn(p5150Info,EVENT_GLOBAL_SLEEP_PROC_VIDEO_ID))
+		{
+			eventInterClrEvent(p5150Info,EVENT_GLOBAL_SLEEP_PROC_VIDEO_ID);
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep
+				!= p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeVideoSleep)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep
+					= p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeVideoSleep;
+
+				powerNormalInit(p5150Info);
+
+				RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 Proc Before Sleep Finish")));
+			}
+		}
+		if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep)
+		{
+			continue;
+		}
+
+		if (FALSE == p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeVideoSleep
+			&& FALSE == p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep)
+		{
+			p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeVideoSleep = TRUE;
+			p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep = FALSE;
+			powerNormalInit(p5150Info);
+		}
+
+		if (eventInterWhatEventOn(p5150Info,EVENT_GLOBAL_STANDBY_VIDEO_ID))//因为碟机复位，延时一下
+		{
+			eventInterClrEvent(p5150Info,EVENT_GLOBAL_STANDBY_VIDEO_ID);
+
+			if (!p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bStandbyStatus)
+			{
+				if (p5150Info->bPreVideoEnable && MediaCD == p5150Info->iPreVideoChannel)
+				{
+					Sleep(618);
+				}
+			}
+		}
+		eventInterClrEvent(p5150Info,EVENT_GLOBAL_BACKDETECT_CHANGE_ID);
+
+		if (eventInterWhatEventOn(p5150Info,EVENT_GLOBAL_AUX_CHECK_START_ID))
+		{
+			p5150Info->iPreVideoChannel = AUX;
+		}
+
+		if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable
+			&& p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackActiveNow)
+		{
+			if (p5150Info->bBackVideoOn)
+			{
+				p5150Info->bTempVideoEnable = TRUE;
+				p5150Info->iTempVideoChannel = BACK;
+			}
+			else
+			{
+				p5150Info->bTempVideoEnable = FALSE;
+				p5150Info->iTempVideoChannel = BACK;
+			}
+
+			p5150Info->iTempVideoParaColor = COLOR_STEP_COUNT/2;
+			p5150Info->iTempVideoParaHue = COLOR_STEP_COUNT/2;
+			p5150Info->iTempVideoParaContrast = COLOR_STEP_COUNT/2;
+			if((p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iCarName == CAR_CRV_12)
+				&&(p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iSteelAD[0]>860)//低配版的CRV使用的是AD方向盘
+				&&(p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iSteelAD[1]>860))
+				p5150Info->iTempVideoParaBrightness = 10;
+			else
+				p5150Info->iTempVideoParaBrightness = COLOR_STEP_COUNT/2;
+		}
+		else
+		{
+			p5150Info->bTempVideoEnable = p5150Info->bPreVideoEnable;
+			p5150Info->iTempVideoChannel = p5150Info->iPreVideoChannel;
+
+			p5150Info->iTempVideoParaColor = p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor;
+			p5150Info->iTempVideoParaHue = p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue;
+			p5150Info->iTempVideoParaContrast = p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast;
+			p5150Info->iTempVideoParaBrightness = p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness;
+		}
+		if (p5150Info->iCurVideoChannel != p5150Info->iTempVideoChannel)//通道
+		{
+			p5150Info->iCurVideoChannel = p5150Info->iTempVideoChannel;
+			
+			p5150Info->cVinConfig.black = TRUE;
+			actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_ENABLE);
+			p5150Info->bChannelChangeNeedEnable = TRUE;
+
+			if (BACK == p5150Info->iCurVideoChannel)
+			{
+				Video_4052VideoSwitch_BackNotAUXiPod(p5150Info);
+			}
+			else// if (IPOD == p5150Info->iCurVideoChannel || AUX == p5150Info->iCurVideoChannel)
+			{
+				Video_4052VideoSwitch_AUXiPodNotBack(p5150Info);
+			}
+			if (MediaCD == p5150Info->iCurVideoChannel)
+			{
+				p5150Info->cVinConfig.channel = 1;
+			}
+			else
+			{
+				p5150Info->cVinConfig.channel = 0;
+			}
+			actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_CHANNEL);
+			p5150Info->iChannelChangeTime = GetTickCount();
+		}
+
+		if (eventInterWhatEventOn(p5150Info,EVENT_GLOBAL_AUX_CHECK_START_ID))
+		{
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable
+				&& p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackActiveNow)
+			{
+			}
+			else if (p5150Info->iCurVideoChannel == AUX)
+			{
+				eventInterClrEvent(p5150Info,EVENT_GLOBAL_AUX_CHECK_START_ID);
+				Sleep(618);
+				p5150Info->bAuxVideoOn = SOC_VIN_Detect();
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAUXHaveVideo = p5150Info->bAuxVideoOn;
+				eventInterSetEvent(p5150Info,EVENT_GLOBAL_AUX_CHECK_RETURN_ID);
+			}
+		}
+
+		if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable
+			&& p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackActiveNow)
+		{
+		}
+		else if (p5150Info->iCurVideoChannel == AUX)
+		{
+			waitTime = 618;
+			if (GetTickCount() - p5150Info->iChannelChangeTime >= 618)
+			{
+				p5150Info->bAuxVideoOn = SOC_VIN_Detect();
+				if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAUXHaveVideo != p5150Info->bAuxVideoOn)
+				{
+					p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAUXHaveVideo = p5150Info->bAuxVideoOn;
+					eventInterSetEvent(p5150Info,EVENT_GLOBAL_AUX_CHECK_RETURN_ID);
+				}
+			}
+		}
+
+		if (p5150Info->iVideoParaColor != p5150Info->iTempVideoParaColor)//色彩
+		{
+			p5150Info->iVideoParaColor = p5150Info->iTempVideoParaColor;
+			p5150Info->cVinConfig.color = sColor_N[p5150Info->iVideoParaColor];
+			actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_DISPLAY);
+			returnDisplayValue(p5150Info,E_C_COLOR,p5150Info->iVideoParaColor);
+		}
+		if (p5150Info->iVideoParaHue != p5150Info->iTempVideoParaHue)//色调
+		{
+			p5150Info->iVideoParaHue = p5150Info->iTempVideoParaHue;
+			p5150Info->cVinConfig.hue = sHue_N[p5150Info->iVideoParaHue];
+			actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_DISPLAY);
+			returnDisplayValue(p5150Info,E_C_HUE,p5150Info->iVideoParaHue);
+		}
+		if (p5150Info->iVideoParaContrast != p5150Info->iTempVideoParaContrast)//对比度
+		{
+			p5150Info->iVideoParaContrast = p5150Info->iTempVideoParaContrast;
+			p5150Info->cVinConfig.contrast = sContrast_N[p5150Info->iVideoParaContrast];
+			actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_DISPLAY);
+			returnDisplayValue(p5150Info,E_C_CONTRAST,p5150Info->iVideoParaContrast);
+		}
+		if (p5150Info->iVideoParaBrightness != p5150Info->iTempVideoParaBrightness)//亮度
+		{
+			p5150Info->iVideoParaBrightness = p5150Info->iTempVideoParaBrightness;
+			p5150Info->cVinConfig.brightness = sBrightness_N[p5150Info->iVideoParaBrightness];
+			actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_DISPLAY);
+			returnDisplayValue(p5150Info,E_C_BRIGHTNESS,p5150Info->iVideoParaBrightness);
+		}
+
+		if (p5150Info->bCurVideoEnable != p5150Info->bTempVideoEnable)//开关
+		{
+			p5150Info->bCurVideoEnable = p5150Info->bTempVideoEnable;
+			p5150Info->cVinConfig.enable = p5150Info->bCurVideoEnable;
+			if (p5150Info->cVinConfig.enable)//如果是开，去切换通道抖动延时
+			{
+			}
+			actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_ENABLE);
+		}
+
+		if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bStandbyStatus)
+		{
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable
+				&& p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackVideoOn)//倒车且有视频
+			{
+				p5150Info->bPreVideoBlack = FALSE;
+			}
+			else
+			{
+				p5150Info->bPreVideoBlack = TRUE;
+			}
+		}
+		else
+		{
+			p5150Info->bPreVideoBlack = FALSE;
+		}
+		if (p5150Info->bCurVideoBlack != p5150Info->bPreVideoBlack)
+		{
+			p5150Info->bCurVideoBlack = p5150Info->bPreVideoBlack;
+			if (p5150Info->bCurVideoBlack)
+			{
+				p5150Info->cVinConfig.black = TRUE;
+				actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_ENABLE);
+				p5150Info->bChannelChangeNeedEnable = TRUE;
+			}
+		}
+
+		if (!p5150Info->bCurVideoBlack)
+		{
+			if (p5150Info->bChannelChangeNeedEnable)
+			{
+				p5150Info->bChannelChangeNeedEnable = FALSE;
+				ULONG iTempTimer;
+				iTempTimer = GetTickCount() - p5150Info->iChannelChangeTime;
+				RETAILMSG(1, (TEXT("\r\n5150 Enable DelayTimer:%d"),iTempTimer));
+				if (iTempTimer < 314)
+				{
+					Sleep(314 - iTempTimer);
+				}
+				p5150Info->cVinConfig.black = FALSE;
+				actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_ENABLE);
+			}
+		}
+
+		if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable)
+		{
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackActiveNow)
+			{
+				waitTime = 100;
+				DBG3(RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 BackActive")));)
+					if (p5150Info->bBackChecking)
+					{
+						if ((GetTickCount() - p5150Info->iBackStartCheckingTime) >= BACK_VIDEO_ACTIVE_DELAY_TIME)//延时检测
+						{
+							if (SOC_VIN_Detect())
+							{
+								p5150Info->bBackVideoOn = TRUE;
+								DBG3(RETAILMSG(1, (TEXT(" VideoOn")));)
+							}
+							else
+							{
+								p5150Info->bBackVideoOn = FALSE;
+								DBG3(RETAILMSG(1, (TEXT(" VideoOff")));)
+							}
+							if (p5150Info->bBackCheckNeedFirstReturn
+								|| p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackVideoOn != p5150Info->bBackVideoOn)
+							{
+								p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackVideoOn = p5150Info->bBackVideoOn;
+								p5150Info->iBackStartReturnTime = GetTickCount();
+								p5150Info->bBackCheckNeedFirstReturn = FALSE;
+								p5150Info->bBackCheckReturn = TRUE;
+								DBG3(RETAILMSG(1, (TEXT(" Video Return%d"),p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackVideoOn));)
+							}
+						}
+						else
+						{
+							DBG3(RETAILMSG(1, (TEXT(" Delay%d"),SOC_VIN_Detect()));)
+						}
+					}
+					else
+					{
+						DBG3(RETAILMSG(1, (TEXT(" Start")));)
+							p5150Info->bBackChecking = TRUE;
+						p5150Info->bBackCheckNeedFirstReturn = TRUE;
+						p5150Info->bBackCheckReturn = FALSE;
+						p5150Info->iBackStartCheckingTime = GetTickCount();
+					}
+			}
+			else
+			{
+				p5150Info->bBackChecking = FALSE;
+				p5150Info->bBackCheckNeedFirstReturn = TRUE;
+				p5150Info->bBackCheckReturn = FALSE;
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackVideoOn = FALSE;
+			}
+		}
+		else
+		{
+			p5150Info->bBackChecking = FALSE;
+			p5150Info->bBackCheckNeedFirstReturn = TRUE;
+			p5150Info->bBackCheckReturn = FALSE;
+			p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackVideoOn = FALSE;
+		}
+
+		if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable)
+		{
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackActiveNow)
+			{
+				if (p5150Info->bBackCheckReturn)
+				{
+					if (p5150Info->bBackVideoOn)
+					{
+						eventInterSetEvent(p5150Info,EVENT_GLOBAL_BACKDETECT_RETURN_ID);
+						p5150Info->bBackCheckReturn = FALSE;
+						DBG3(RETAILMSG(1, (TEXT(" ActVideo Return%d"),p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackVideoOn));)
+					}
+					else
+					{
+						if ((GetTickCount() - p5150Info->iBackStartReturnTime) > BACK_VIDEO_DISAPPEAR_DELAY_TIME)
+						{
+							eventInterSetEvent(p5150Info,EVENT_GLOBAL_BACKDETECT_RETURN_ID);
+							p5150Info->bBackCheckReturn = FALSE;
+							DBG3(RETAILMSG(1, (TEXT(" ActVideo Return%d"),p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackVideoOn));)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	p5150Info->FlyMainThreadHandle = NULL;
+	CloseHandle(p5150Info->hDispatchMainThreadEvent);
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 ThreadMain exit")));
+	return 0;
+}
+
+void Fly5150Enable(P_FLY_5150_INFO p5150Info,BOOL bEnable)
+{
+	DWORD dwThreadID;
+	if (bEnable)
+	{
+		if (p5150Info->bPower)
+		{
+			return;
+		}
+		p5150Info->bPower = TRUE;
+
+		p5150Info->bKillDispatchFlyMainThread = FALSE;
+		p5150Info->hDispatchMainThreadEvent = CreateEvent(NULL, FALSE, TRUE, DATA_GLOBAL_HANDLE_VIDEO);	
+		p5150Info->FlyMainThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadMain, //线程的全局函数
+			p5150Info, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\n5150 ThreadMain thread!%x"),dwThreadID));)
+		if (NULL == p5150Info->FlyMainThreadHandle)
+		{
+			p5150Info->bKillDispatchFlyMainThread = TRUE;
+			return;
+		}
+
+		SetEvent(p5150Info->hDispatchMainThreadEvent);
+	}
+	else
+	{
+		if (!p5150Info->bPower)
+		{
+			return;
+		}
+		p5150Info->bPower = FALSE;
+		p5150Info->bPowerUp = FALSE;
+
+		p5150Info->bKillDispatchFlyMainThread = TRUE;
+		SetEvent(p5150Info->hDispatchMainThreadEvent);
+
+		while (p5150Info->FlyMainThreadHandle)
+		{
+			SetEvent(p5150Info->hDispatchMainThreadEvent);
+			Sleep(10);
+		}
+	}
+}
+
+static VOID WinCECommandProcessor(P_FLY_5150_INFO p5150Info,BYTE *buff,UINT len)
+{
+	switch (buff[0])
+	{
+	case 0x01:
+		if (0x01 == buff[1])
+		{
+			returnDisplayValue(p5150Info,E_C_COLOR,p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor);
+			returnDisplayValue(p5150Info,E_C_HUE,p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue);
+			returnDisplayValue(p5150Info,E_C_CONTRAST,p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast);
+			returnDisplayValue(p5150Info,E_C_BRIGHTNESS,p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness);
+			returnVideoPowerMode(p5150Info,1);
+			returnVideoWorkMode(p5150Info,1);
+		}
+		else
+		{
+			returnVideoPowerMode(p5150Info,0);
+		}
+		break;
+	case 0x10:
+		if (0x00 == buff[1] || 0x80 == buff[1])
+		{
+			p5150Info->bPreVideoEnable = FALSE;
+			p5150Info->iPreVideoChannel = buff[1];
+		}
+		else
+		{
+			p5150Info->bPreVideoEnable = TRUE;
+			p5150Info->iPreVideoChannel = buff[1];
+		}
+		p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.eVideoInput = buff[1];
+		if (p5150Info->bPowerUp)
+		{
+			SetEvent(p5150Info->hDispatchMainThreadEvent);
+			FlyReturnToUser(p5150Info,buff,len);
+		}
+		break;
+	case 0x11:
+		switch (buff[1])
+		{
+		case 0x01:
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor < COLOR_STEP_COUNT - 1)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor++;
+			} 
+			else
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor = COLOR_STEP_COUNT - 1;
+			}
+			if (p5150Info->bPowerUp)
+			{
+				SetEvent(p5150Info->hDispatchMainThreadEvent);
+			}
+			break;
+		case 0x02:
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor >= COLOR_STEP_COUNT)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor = COLOR_STEP_COUNT - 1;
+			} 
+			else if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor--;
+			}
+			else
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor = 0;
+			}
+			if (p5150Info->bPowerUp)
+			{
+				SetEvent(p5150Info->hDispatchMainThreadEvent);
+			}
+			break;
+		case 0x03:
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue < COLOR_STEP_COUNT - 1)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue++;
+			} 
+			else
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue = COLOR_STEP_COUNT - 1;
+			}
+			if (p5150Info->bPowerUp)
+			{
+				SetEvent(p5150Info->hDispatchMainThreadEvent);
+			}
+			break;
+		case 0x04:
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue >= COLOR_STEP_COUNT)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue = COLOR_STEP_COUNT - 1;
+			} 
+			else if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue--;
+			}
+			else
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue = 0;
+			}
+			if (p5150Info->bPowerUp)
+			{
+				SetEvent(p5150Info->hDispatchMainThreadEvent);
+			}
+			break;
+		case 0x05:
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast < COLOR_STEP_COUNT - 1)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast++;
+			} 
+			else
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast = COLOR_STEP_COUNT - 1;
+			}
+			if (p5150Info->bPowerUp)
+			{
+				SetEvent(p5150Info->hDispatchMainThreadEvent);
+			}
+			break;
+		case 0x06:
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast >= COLOR_STEP_COUNT)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast = COLOR_STEP_COUNT - 1;
+			} 
+			else if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast--;
+			}
+			else
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast = 0;
+			}
+			if (p5150Info->bPowerUp)
+			{
+				SetEvent(p5150Info->hDispatchMainThreadEvent);
+			}
+			break;
+		case 0x07:
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness < COLOR_STEP_COUNT - 1)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness++;
+			} 
+			else
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness = COLOR_STEP_COUNT - 1;
+			}
+			if (p5150Info->bPowerUp)
+			{
+				SetEvent(p5150Info->hDispatchMainThreadEvent);
+			}
+			break;
+		case 0x08:
+			if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness >= COLOR_STEP_COUNT)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness = COLOR_STEP_COUNT - 1;
+			} 
+			else if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness)
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness--;
+			}
+			else
+			{
+				p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness = 0;
+			}
+			if (p5150Info->bPowerUp)
+			{
+				SetEvent(p5150Info->hDispatchMainThreadEvent);
+			}
+			break;
+		default:
+			break;
+		}
+		break;
+	case 0xF0:
+		p5150Info->cVinConfig.alpha = 128;
+		actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_DISPLAY);
+		break;
+	case 0xFF:
+		if (0x01 == buff[1])
+		{
+			FVO_PowerUp((DWORD)p5150Info);
+		} 
+		else if (0x00 == buff[1])
+		{
+			FVO_PowerDown((DWORD)p5150Info);
+		}
+		break;
+	default:
+		break;
+	}
+};
+
+static void powerNormalInit(P_FLY_5150_INFO p5150Info)
+{
+	p5150Info->buffToUserHx = 0;
+	p5150Info->buffToUserLx = 0;
+
+	p5150Info->bBackChecking = FALSE;
+	p5150Info->bBackVideoOn = FALSE;
+	p5150Info->bBackCheckNeedFirstReturn = TRUE;
+	p5150Info->bBackCheckReturn = FALSE;
+	p5150Info->iBackStartCheckingTime = 0;
+	p5150Info->iBackStartReturnTime = 0;
+
+	p5150Info->iPreVideoChannel = 0;
+	p5150Info->iCurVideoChannel = 0;
+	p5150Info->iChannelChangeTime = GetTickCount();
+	p5150Info->bPreVideoEnable = FALSE;
+	p5150Info->bCurVideoEnable = FALSE;
+	p5150Info->bPreVideoBlack = FALSE;
+	p5150Info->bCurVideoBlack = FALSE;
+
+	p5150Info->bAuxVideoOn = FALSE;
+
+	p5150Info->iVideoParaColor = p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaColor;
+	p5150Info->iVideoParaHue = p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaHue;
+	p5150Info->iVideoParaContrast = p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaContrast;
+	p5150Info->iVideoParaBrightness = p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVideoParaBrightness;
+
+	p5150Info->cVinConfig.enable = FALSE;
+	p5150Info->cVinConfig.black = FALSE;
+	p5150Info->cVinConfig.channel = 0;
+	p5150Info->cVinConfig.width = 800;
+	p5150Info->cVinConfig.height = 480;
+	p5150Info->cVinConfig.pos_x = 0;
+	p5150Info->cVinConfig.pos_y = 0;
+	p5150Info->cVinConfig.brightness = sBrightness_N[p5150Info->iVideoParaBrightness];
+	p5150Info->cVinConfig.color = sColor_N[p5150Info->iVideoParaColor];
+	p5150Info->cVinConfig.hue = sHue_N[p5150Info->iVideoParaHue];
+	p5150Info->cVinConfig.contrast = sContrast_N[p5150Info->iVideoParaContrast];
+	p5150Info->cVinConfig.alpha = 255;
+	actualChangeVideoInput(p5150Info,&p5150Info->cVinConfig,SET_ALL);
+
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 Normal Init!")));
+}
+
+static void powerOnFirstInit(P_FLY_5150_INFO p5150Info)
+{
+	p5150Info->bOpen = FALSE;
+	p5150Info->bPower = FALSE;
+	p5150Info->bPowerUp = FALSE;
+	p5150Info->bSpecialPower = FALSE;
+
+	p5150Info->bKillDispatchFlyMainThread = TRUE;
+	p5150Info->FlyMainThreadHandle = NULL;
+	p5150Info->hDispatchMainThreadEvent = NULL;
+}
+
+static void powerOnSpecialEnable(P_FLY_5150_INFO p5150Info,BOOL bOn)
+{
+	if (bOn)
+	{
+		if (p5150Info->bSpecialPower)
+		{
+			return;
+		}
+		p5150Info->bSpecialPower = TRUE;
+
+		p5150Info->hBuffToUserDataEvent = CreateEvent(NULL,FALSE,FALSE,NULL);	
+		InitializeCriticalSection(&p5150Info->hCSSendToUser);
+	}
+	else
+	{
+		if (!p5150Info->bSpecialPower)
+		{
+			return;
+		}
+		p5150Info->bSpecialPower = FALSE;
+
+		CloseHandle(p5150Info->hBuffToUserDataEvent);
+	}
+}
+
+HANDLE
+FVO_Init(DWORD dwContext)
+{
+	P_FLY_5150_INFO p5150Info;
+
+	RETAILMSG(1, (TEXT("\r\n5150 Init Start")));
+
+	pUDDApiTable = UDD_ConnectService();
+	if(SOC_Version_Check(SOC_DRV_VERSION) == FALSE)
+	{
+		RETAILMSG(1, (TEXT("FlyAudio 5150 Error On SOC_Version_Check!\r\n")));
+		// 错误处理
+	}
+	p5150Info = (P_FLY_5150_INFO)LocalAlloc(LPTR, sizeof(FLY_5150_INFO));
+	if (!p5150Info)
+	{
+		return NULL;
+	}
+	//全局
+	p5150Info->pFlyDriverGlobalInfo = SOC_DriverGlobal_Get();
+
+	if (p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalStructSize
+		!= sizeof(FLY_DRIVER_GLOBAL))
+	{
+		p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[0] = 'F';
+		p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[1] = 'V';
+		p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[2] = 'O';
+	}
+
+	Video_4052VideoSwitch_Init(p5150Info);
+
+
+	//参数初始化
+	powerOnFirstInit(p5150Info);
+	powerNormalInit(p5150Info);
+	powerOnSpecialEnable(p5150Info,TRUE);
+
+	p5150Info->hHandleGlobalGlobalEvent = CreateEvent(NULL,FALSE,FALSE,DATA_GLOBAL_HANDLE_GLOBAL);
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalVideoInfo.bInit = TRUE;
+
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompYear = year;
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompMon = months;
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompDay = day;
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompHour = hours;
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompMin = minutes;
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.iDriverCompSec = seconds;
+
+	Fly5150Enable(p5150Info,TRUE);
+
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 Init Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));
+	return (HANDLE)p5150Info;
+}
+
+BOOL
+FVO_Deinit(DWORD hDeviceContext)
+{
+	P_FLY_5150_INFO	p5150Info = (P_FLY_5150_INFO)hDeviceContext;
+
+	Fly5150Enable(p5150Info,FALSE);
+
+	//全局
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalVideoInfo.bInit = FALSE;
+	SetEvent(p5150Info->hHandleGlobalGlobalEvent);
+	CloseHandle(p5150Info->hHandleGlobalGlobalEvent);
+
+	powerOnSpecialEnable(p5150Info,FALSE);
+
+	RETAILMSG(1, (TEXT("FlyAudio 5150 DeInit\r\n")));
+	LocalFree(p5150Info);
+	return TRUE;
+}
+
+DWORD
+FVO_Open(DWORD hDeviceContext, DWORD AccessCode, DWORD ShareMode)
+{
+	P_FLY_5150_INFO	p5150Info = (P_FLY_5150_INFO)hDeviceContext;
+	DWORD returnWhat = hDeviceContext;
+
+	if (p5150Info->bOpen)
+	{
+		return NULL;
+	}
+	p5150Info->bOpen = TRUE;
+
+	//全局
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalVideoInfo.bOpen = TRUE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeVideoSleep = FALSE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep = FALSE;
+	SetEvent(p5150Info->hHandleGlobalGlobalEvent);
+
+	RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 Open Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));
+	return returnWhat;
+}
+
+BOOL
+FVO_Close(DWORD hDeviceContext)
+{
+	P_FLY_5150_INFO	p5150Info = (P_FLY_5150_INFO)hDeviceContext;
+
+	SetEvent(p5150Info->hBuffToUserDataEvent);
+
+	//全局
+	p5150Info->pFlyDriverGlobalInfo->FlyGlobalVideoInfo.bOpen = FALSE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeVideoSleep = TRUE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep = TRUE;
+	SetEvent(p5150Info->hHandleGlobalGlobalEvent);
+
+	p5150Info->bOpen = FALSE;
+
+	RETAILMSG(1, (TEXT("FlyAudio 5150 Close\r\n")));
+	return TRUE;
+}
+
+VOID
+FVO_PowerUp(DWORD hDeviceContext)
+{
+	P_FLY_5150_INFO	p5150Info = (P_FLY_5150_INFO)hDeviceContext;
+
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeVideoSleep = FALSE;
+	p5150Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeVideoSleep = FALSE;
+	SetEvent(p5150Info->hDispatchMainThreadEvent);
+
+	RETAILMSG(1, (TEXT("FlyAudio 5150 PowerUp\r\n")));
+}
+
+VOID
+FVO_PowerDown(DWORD hDeviceContext)
+{
+	P_FLY_5150_INFO	p5150Info = (P_FLY_5150_INFO)hDeviceContext;
+
+	RETAILMSG(1, (TEXT("FlyAudio 5150 PowerDown\r\n")));
+}
+
+DWORD
+FVO_Read(DWORD hOpenContext, LPVOID pBuffer, DWORD Count)
+{
+	P_FLY_5150_INFO	p5150Info = (P_FLY_5150_INFO)hOpenContext;
+
+	UINT dwRead = 0;
+	BYTE *SendBuf = (BYTE *)pBuffer;
+
+	while(dwRead < Count && p5150Info->buffToUserLx != p5150Info->buffToUserHx)
+	{
+		SendBuf[dwRead++] = p5150Info->buffToUser[p5150Info->buffToUserLx++];
+		if (p5150Info->buffToUserLx >= DATA_BUFF_LENGTH)
+		{
+			p5150Info->buffToUserLx = 0;
+		}
+	}
+	if(p5150Info->buffToUserLx != p5150Info->buffToUserHx)
+	{
+		SetEvent(p5150Info->hBuffToUserDataEvent);
+	}
+	return dwRead;
+}
+
+DWORD
+FVO_Write(DWORD hOpenContext, LPCVOID pSourceBytes, DWORD NumberOfBytes)
+{
+	P_FLY_5150_INFO	p5150Info = (P_FLY_5150_INFO)hOpenContext;
+	RETAILMSG(1, (TEXT("FlyAudio 5150 Write %d \r\n"),
+					NumberOfBytes));
+	for(UINT i = 0;i < NumberOfBytes;i++)
+	{
+		RETAILMSG(1, (TEXT(" %X"),
+			*((BYTE *)pSourceBytes + i)));
+	}
+	if(NumberOfBytes)
+	{
+		WinCECommandProcessor(p5150Info,(((BYTE *)pSourceBytes)+3),((BYTE *)pSourceBytes)[2]);
+	}
+
+	return NULL;
+}
+
+DWORD
+FVO_Seek(DWORD hOpenContext, LONG Amount, DWORD  Type)
+{
+	return NULL;
+}
+
+BOOL
+FVO_IOControl(DWORD hOpenContext,
+			  DWORD dwCode, PBYTE pBufIn, DWORD dwLenIn,
+			  PBYTE pBufOut, DWORD dwLenOut, PDWORD pdwActualOut)
+{
+	P_FLY_5150_INFO	p5150Info = (P_FLY_5150_INFO)hOpenContext;
+	BOOL bRes = TRUE;
+
+	if (dwCode != IOCTL_SERIAL_WAIT_ON_MASK)
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 IOControl(h:0x%X, Code:%X, IN:0x%X, %d, OUT:0x%X, %d, ActOut:0x%X)"),
+			hOpenContext, dwCode, pBufIn, dwLenIn, pBufOut, dwLenOut, pdwActualOut));)
+	}
+
+	switch (dwCode)
+	{
+	case IOCTL_SERIAL_SET_WAIT_MASK:
+		DBG3(RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 IOControl Set IOCTL_SERIAL_SET_WAIT_MASK")));)
+			break;
+	case IOCTL_SERIAL_WAIT_ON_MASK:
+		DBG3(RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 IOControl Set IOCTL_SERIAL_WAIT_ON_MASK Enter")));)
+			if (p5150Info->bOpen)
+			{
+				WaitForSingleObject(p5150Info->hBuffToUserDataEvent,INFINITE);
+			} 
+			else
+			{
+				WaitForSingleObject(p5150Info->hBuffToUserDataEvent,0);
+			}
+			if ((dwLenOut < sizeof(DWORD)) || (NULL == pBufOut) ||
+				(NULL == pdwActualOut))
+			{
+				bRes = FALSE;
+				break;
+			}
+			*(DWORD *)pBufOut = EV_RXCHAR;
+			*pdwActualOut = sizeof(DWORD);
+			DBG3(RETAILMSG(1, (TEXT("\r\nFlyAudio 5150 IOControl Set IOCTL_SERIAL_WAIT_ON_MASK Exit")));)
+				break;
+	default :
+		break;
+	}
+
+	return TRUE;
+}
+
+BOOL
+DllEntry(
+		 HINSTANCE hinstDll,
+		 DWORD dwReason,
+		 LPVOID lpReserved
+		 )
+{
+	if (dwReason == DLL_PROCESS_ATTACH)
+	{
+		DEBUGMSG(1, (TEXT("Attach in Fly5150 DllEntry\n")));
+		DisableThreadLibraryCalls((HMODULE)hinstDll);
+	}
+
+	if (dwReason == DLL_PROCESS_DETACH)
+	{
+		DEBUGMSG(1, (TEXT("Dettach in Fly5150 DllEntry\n")));
+	}
+
+	DEBUGMSG(1, (TEXT("Leaving Fly5150 DllEntry\n")));
+
+	return (TRUE);
+}

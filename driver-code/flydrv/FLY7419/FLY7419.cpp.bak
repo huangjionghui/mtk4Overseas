@@ -1,0 +1,2817 @@
+// FLY7419.cpp : Defines the entry point for the DLL application.
+//
+//>>>2011-05-20: V0.02 整理了WinCE待机相关的代码	JQilin
+
+#include <drvlib.h>
+#include <bspregmap.h>
+#include <oemintr.h>
+#include <oemdrvlib.h>
+#include "I2C.h"
+#include <pegdser.h>
+#include "driver_global.h"
+#include "FLY7419_Data.h"
+#include "FLY7419.h"
+
+#include "SOC_FuncDef.h"
+#include "SOC_Service.h"
+PUDD_API_TABLE	  pUDDApiTable=NULL;
+
+//软件编译日期
+#define DIGIT(s, no) ((s)[no] - '0')
+
+const int hours = (10 * DIGIT(__TIME__, 0) + DIGIT(__TIME__, 1));
+const int minutes = (10 * DIGIT(__TIME__, 3) + DIGIT(__TIME__, 4));
+const int seconds = (10 * DIGIT(__TIME__, 6) + DIGIT(__TIME__, 7));
+/* WARNING: This will fail in year 10000 and beyond, as it assumes
+* that a year has four digits. */
+const int year = ( 1000 * DIGIT(__DATE__, 7)
+				  + 100 * DIGIT(__DATE__, 8)
+				  + 10 * DIGIT(__DATE__, 9)
+				  + DIGIT(__DATE__, 10));
+
+/*
+* Jan - 1
+* Feb - 2
+* Mar - 3
+* Apr - 4
+* May - 5
+* Jun - 6
+* Jul - 7
+* Aug - 8
+* Sep - 9
+* Oct - 10
+* Nov - 11
+* Dec - 12
+*/
+
+/* Use the last letter as primary "key" and middle letter whenever
+* two months end in the same letter. */
+const int months = (__DATE__[2] == 'b' ? 2 :
+					(__DATE__[2] == 'y' ? 5 :
+					(__DATE__[2] == 'l' ? 7 :
+					(__DATE__[2] == 'g' ? 8 :
+					(__DATE__[2] == 'p' ? 9 :
+					(__DATE__[2] == 't' ? 10 :
+					(__DATE__[2] == 'v' ? 11 :
+					(__DATE__[2] == 'c' ? 12 :
+					(__DATE__[2] == 'n' ?
+					(__DATE__[1] == 'a' ? 1 : 6) :
+					/* Implicit "r" */
+					(__DATE__[1] == 'a' ? 3 : 4))))))))));
+const int day = ( 10 * (__DATE__[4] == ' ' ? 0 : DIGIT(__DATE__, 4))
+				 + DIGIT(__DATE__, 5));
+//软件编译日期
+
+void FAU_Init(void);
+void FAU_PowerUp(DWORD hDeviceContext);
+void FAU_PowerDown(DWORD hDeviceContext);
+void TDA7419_Volume(P_FLY_TDA7419_INFO pTda7419Info, BYTE iVolume);
+void TDA7419_Navi_Mix(P_FLY_TDA7419_INFO pTda7419Info,BYTE para);
+void Fly7419Enable(P_FLY_TDA7419_INFO pTda7419Info,BOOL bOn);
+void Fly7419AudioParaInitDefault(P_FLY_TDA7419_INFO pTda7419Info);
+DWORD WINAPI ExtAmpProcessThread(LPVOID pContext);
+
+static void eventInterSetEvent(P_FLY_TDA7419_INFO pTda7419Info,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = TRUE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = GetTickCount();
+	LeaveCriticalSection(&pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	SetEvent(pTda7419Info->hHandleGlobalGlobalEvent);
+}
+
+static void eventInterClrEvent(P_FLY_TDA7419_INFO pTda7419Info,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = FALSE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = 0;
+	LeaveCriticalSection(&pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+}
+
+static BOOL eventInterWhatEventOn(P_FLY_TDA7419_INFO pTda7419Info,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat])
+	{
+		LeaveCriticalSection(&pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+		return TRUE;
+	}
+	LeaveCriticalSection(&pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	return FALSE;
+}
+
+#define FLY7419_I2C_FREQ   100000      //100Khz
+
+#define LARGER(A, B)    ((A) >= (B)? (A):(B))
+
+BYTE I2WriteSeq_Tda7419[] = {SEG_MASK_SEND_START | I2C_SEQ_SEG_DEVADDR_W | SEG_MASK_NEED_ACK,//写从设备地址
+I2C_SEQ_SEG_REGADDR | SEG_MASK_NEED_ACK,//写寄存器地址,先发低字节
+I2C_SEQ_SEG_DATA | SEG_MASK_NEED_ACK | SEG_MASK_SEND_STOP
+};
+
+BYTE I2CReadSeq_Tda7419[] = {//SEG_MASK_SEND_START | I2C_SEQ_SEG_DEVADDR_W | SEG_MASK_NEED_ACK,//写从设备地址
+//I2C_SEQ_SEG_REGADDR | SEG_MASK_NEED_ACK,//写寄存器地址,先发低字节
+SEG_MASK_SEND_START | I2C_SEQ_SEG_DEVADDR_R | SEG_MASK_NEED_ACK,//发读命令
+I2C_SEQ_SEG_DATA    | SEG_MASK_NEED_NACK | SEG_MASK_SEND_STOP, //读数据,要使用NACK
+};
+
+const GUID DEVICE_IFC_I2C_GUID;
+
+#define IO_4052_A_G	3
+#define IO_4052_A_I	10
+#define IO_4052_B_G	3
+#define IO_4052_B_I	9
+
+#define IO_7386_MUTE_G	2
+#define IO_7386_MUTE_I	24
+
+#if SHICHAN_SHICHAN
+#define IO_7386_MUTE_ON		0
+#define IO_7386_MUTE_OFF	1
+#else
+#define IO_7386_MUTE_ON		1
+#define IO_7386_MUTE_OFF	0
+#endif
+
+VOID IO_Control_Init(P_FLY_TDA7419_INFO pTda7419Info)
+{
+	SOC_IO_Output(IO_7386_MUTE_G,IO_7386_MUTE_I,IO_7386_MUTE_ON);
+
+	SOC_IO_Output(IO_4052_A_G,IO_4052_A_I,1);
+	SOC_IO_Output(IO_4052_B_G,IO_4052_B_I,0);
+}
+
+static void control4052Input(P_FLY_TDA7419_INFO pTda7419Info,audio_source eInput)
+{
+	if (BT_RING == eInput || MediaMP3 == eInput || IPOD == eInput)
+	{
+		SOC_IO_Output(IO_4052_A_G,IO_4052_A_I,1);
+	}
+	else if (BT == eInput)
+	{
+		SOC_IO_Output(IO_4052_A_G,IO_4052_A_I,0);
+	}
+}
+
+static void control7386Mute(P_FLY_TDA7419_INFO pTda7419Info,BOOL bMute)
+{
+	DBG0(RETAILMSG(1, (TEXT("\r\nTda7419 Mute%d"),bMute));)
+	if (bMute)
+	{
+		SOC_IO_Output(IO_7386_MUTE_G,IO_7386_MUTE_I,IO_7386_MUTE_ON);
+	}
+	else
+	{
+		SOC_IO_Output(IO_7386_MUTE_G,IO_7386_MUTE_I,IO_7386_MUTE_OFF);
+	}
+}
+
+static BOOL I2C_Read_Tda7419(P_FLY_TDA7419_INFO pTda7419Info, UCHAR ulRegAddr, PBYTE pRegValBuf, UINT uiValBufLen)
+{
+	if (!pTda7419Info->bOpen)
+	{
+		return TRUE;
+	}
+	I2CTRANS  Trans;
+	Trans.bRead = TRUE;
+	Trans.dwRegAddr = ulRegAddr;
+	Trans.pValueBuf = pRegValBuf;
+	Trans.uiValueLen = uiValBufLen;
+	Trans.dwClock = FLY7419_I2C_FREQ;
+	Trans.i2cdevinfo.pReadSeq = I2CReadSeq_Tda7419;
+	Trans.i2cdevinfo.uiReadSeqLen = sizeof(I2CReadSeq_Tda7419);
+	Trans.i2cdevinfo.pWriteSeq = I2WriteSeq_Tda7419;
+	Trans.i2cdevinfo.uiWriteSeqLen = sizeof(I2WriteSeq_Tda7419);
+	Trans.i2cdevinfo.ulDevAddrW = FLY7419_ADDR_W;
+	Trans.i2cdevinfo.ulDevAddrR = FLY7419_ADDR_R;
+
+	if (!I2CTransact(pTda7419Info->Tda7419I2CHandle, &Trans))
+	{
+		pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iIICErrorOnAudio++;
+		DBG0(RETAILMSG(1, (TEXT("\r\nTda7419:I2C read failed %X"),ulRegAddr));)
+		return FALSE;
+	}
+
+	DBG2(RETAILMSG(1, (TEXT("\r\nTda7419:I2C Read %2X %2X"),ulRegAddr,*pRegValBuf));)
+	return TRUE;
+}
+static BOOL I2C_Write_Tda7419(P_FLY_TDA7419_INFO pTda7419Info, UCHAR ulRegAddr, PBYTE pRegValBuf, UINT uiValBufLen)
+{
+	if (!pTda7419Info->bOpen)
+	{
+		return TRUE;
+	}
+	I2CTRANS  Trans;
+	Trans.bRead = FALSE;
+	Trans.dwRegAddr = ulRegAddr;
+	Trans.pValueBuf = pRegValBuf;
+	Trans.uiValueLen = uiValBufLen;
+	Trans.dwClock = FLY7419_I2C_FREQ;
+	Trans.i2cdevinfo.pReadSeq = I2CReadSeq_Tda7419;
+	Trans.i2cdevinfo.uiReadSeqLen = sizeof(I2CReadSeq_Tda7419);
+	Trans.i2cdevinfo.pWriteSeq = I2WriteSeq_Tda7419;
+	Trans.i2cdevinfo.uiWriteSeqLen = sizeof(I2WriteSeq_Tda7419);
+	Trans.i2cdevinfo.ulDevAddrW = FLY7419_ADDR_W;
+	Trans.i2cdevinfo.ulDevAddrR = FLY7419_ADDR_R;
+
+	if (!I2CTransact(pTda7419Info->Tda7419I2CHandle, &Trans))
+	{
+		pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iIICErrorOnAudio++;
+		DBG0(RETAILMSG(1, (TEXT("\r\nTda7419:I2C write %X failed"),ulRegAddr));)
+		for (UINT i = 0;i < uiValBufLen;i++)
+		{
+			DBG0(RETAILMSG(1, (TEXT("%X"),pRegValBuf[i]));)
+		}
+		return FALSE;
+	}
+
+
+	DBG2(RETAILMSG(1, (TEXT("\r\nTda7419:I2C write %2X %2X"),ulRegAddr,*pRegValBuf));)
+	return TRUE;
+} 
+
+static void Tda7419_Input(P_FLY_TDA7419_INFO pTda7419Info,audio_source channel,BYTE InputGain)
+{
+	BYTE temp;
+	BYTE para = 0;//para 为1 需要52795 切换
+	if(InputGain > 15)InputGain = 15;
+
+	switch(channel)
+	{
+	case Init:
+		TDA7419_Para[0] = 0xff;	   //
+		break;
+	case MediaMP3:
+		temp = (InputGain << 3) + 1;	 //SEL1
+		TDA7419_Para[0] = temp;
+		control4052Input(pTda7419Info,MediaMP3);
+		break;
+	case BT_RING:
+		temp = (InputGain << 3) + 1;	 //SEL1
+		TDA7419_Para[0] = temp;
+		control4052Input(pTda7419Info,BT_RING);
+		break;
+	case BT:
+		temp = (InputGain << 3) + 1;	 //SEL1
+		TDA7419_Para[0] = temp;
+		control4052Input(pTda7419Info,BT);
+		break;
+	case MediaCD:
+		temp = (InputGain << 3) + 2;	  //DVD,SEL2
+		TDA7419_Para[0] = temp;
+		break;
+	case EXT_TEL:
+	//case GPRS :
+	case GPS:
+		TDA7419_Para[0] = 0xff;	   //
+		break;
+	case IPOD ://适应USB控制的IPOD
+		temp = (InputGain << 3) + 1;	 //SEL1
+		TDA7419_Para[0] = temp;
+		control4052Input(pTda7419Info,IPOD);
+		break;
+	case AUX :
+	case TV:
+	case CDC:
+		temp = (InputGain << 3) + 0;
+		TDA7419_Para[0] = temp;
+		break;
+	//case GPRS:
+	//	temp = (InputGain << 3) + 0;
+	//	TDA7419_Para[0] = temp;
+	//	break;
+	case RADIO :
+		//para = 1;
+		temp = (InputGain << 3) + 3;	//52795选通道  SEL3	RADIO
+		TDA7419_Para[0] = temp;				
+		break;
+	}
+	TDA7419_Para[0] = TDA7419_Para[0] | 0x80;
+	I2C_Write_Tda7419(pTda7419Info, 0x00, &TDA7419_Para[0], 1);
+
+	//if(channel == EXT_TEL || channel == GPRS)
+	if(channel == EXT_TEL || channel == GPS)
+		temp = 0x5c;
+	else  
+		temp = 0x1C;
+
+	TDA7419_Para[0x10] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x10, &TDA7419_Para[0x10], 1);
+
+	if (1 == para)
+	{
+		//52595channel_switch()
+	}
+}
+void TDA7419_Mute_Control(P_FLY_TDA7419_INFO pTda7419Info,BOOL bMute) // 7419 静音的特殊处理
+{					   
+	if (bMute)
+	{
+		TDA7419_Para[2] = TDA7419_Para[2] & 0xFE;
+	}
+	else
+	{
+		TDA7419_Para[2] = TDA7419_Para[2] | 0x01;
+	}
+	I2C_Write_Tda7419(pTda7419Info, 0x02, &TDA7419_Para[2], 1);
+}
+void Tda7419_Mute(P_FLY_TDA7419_INFO pTda7419Info,BOOL para)
+{
+	//BYTE temp;
+	if(para)
+	{
+		//temp = 0xfe;
+		//TDA7419_Volume(pTda7419Info, 0);
+		TDA7419_Mute_Control(pTda7419Info, TRUE);
+		//TDA7419_Navi_Mix(pTda7419Info,0);
+		//TDA7419_Para[2] = temp;
+		//I2C_Write_Tda7419(pTda7419Info, 0x02, &TDA7419_Para[2], 1);//soft_mute
+		if (pTda7419Info->FlyAudioInfo.preMainMute)
+		{
+			control7386Mute(pTda7419Info,TRUE);
+		}
+		else
+		{
+			control7386Mute(pTda7419Info,FALSE);
+		}
+	}
+	else
+	{
+		//temp = 0xff;
+		TDA7419_Mute_Control(pTda7419Info, FALSE);
+		//TDA7419_Para[2] = temp;
+		control7386Mute(pTda7419Info,FALSE);
+		//I2C_Write_Tda7419(pTda7419Info, 0x02, &TDA7419_Para[2], 1);//soft_mute  		
+	}
+	
+}
+
+static void TDA7419_Navi_Mix(P_FLY_TDA7419_INFO pTda7419Info,BYTE para)
+{
+	BYTE temp;
+	temp = 0;
+	if(para)
+	{
+		temp = 0xF0 | 0x00 | 0x00 | 0x00 | 0x00;//0xf0
+	}
+	else
+	{
+		temp = 0xF0 | 0x00 | 0x40 | 0x02 | 0x01;//0xff
+	}
+
+	TDA7419_Para[0x09] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x09, &TDA7419_Para[9], 1);
+
+	if (para >= 60)
+	{
+		para = 60;
+	}
+
+	temp = 0;	
+	temp = TDA7419_Para[14] & 0x80;
+	//temp = temp | VolumeMask_Mix[para+6];
+	temp = temp | VolumeMask[para];
+	TDA7419_Para[14] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x0e, &TDA7419_Para[14], 1);
+
+	DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio 7419 reg ----->")));)
+	for (int i = 0;i < 17;i++)
+	{
+		DBG0(RETAILMSG(1, (TEXT(" %X"),TDA7419_Para[i]));)
+	}
+	DBG0(RETAILMSG(1, (TEXT("\r\n")));)
+}
+
+VOID TDA7419_Volume(P_FLY_TDA7419_INFO pTda7419Info, BYTE iVolume)
+{
+	BYTE temp;
+
+	if (iVolume > 60) iVolume = 60;
+	if(EXT_TEL == pTda7419Info->FlyAudioInfo.curMainAudioInput)
+	{
+		iVolume = iVolume + 6;
+	}
+	temp = TDA7419_Para[3] & 0x80;
+	temp = temp | VolumeMask[iVolume];
+	TDA7419_Para[3] = temp;
+
+	I2C_Write_Tda7419(pTda7419Info, 0x03, &TDA7419_Para[3], 1);
+}
+
+VOID TDA7419_Loud(P_FLY_TDA7419_INFO pTda7419Info, BYTE LoudFreq, BYTE LoudLevel)
+{
+	BYTE temp;
+
+	if(LoudFreq > LOUDNESS_FREQ_COUNT - 1)
+		LoudFreq = LOUDNESS_FREQ_COUNT - 1;
+	if(LoudLevel > LOUDNESS_LEVEL_COUNT - 1)
+		LoudLevel = LOUDNESS_LEVEL_COUNT - 1;
+
+	temp = TDA7419_Para[1] & 0xC0;
+	temp = temp | (LoudFreq << 4) | (0x0f & Loud_Mask[LoudLevel]);
+	TDA7419_Para[1] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x01, &TDA7419_Para[1], 1);
+}
+
+static VOID Tda7419_Sub(P_FLY_TDA7419_INFO pTda7419Info, BYTE SubFreq, BYTE SubLevel)
+{
+	BYTE temp;
+	if(SubFreq > SUB_FILTER_COUNT - 1)
+		SubFreq = SUB_FILTER_COUNT - 1;
+	if(SubLevel > SUB_LEVEL_COUNT - 1)
+		SubLevel = SUB_LEVEL_COUNT - 1;
+	//设置增益
+	TDA7419_Para[15] = 0x80;
+	I2C_Write_Tda7419(pTda7419Info, 0x0F, &TDA7419_Para[15], 1);
+	//设置频率
+	temp = TDA7419_Para[8] & 0xFC;
+	temp = temp | SubLevel;
+	TDA7419_Para[8] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x08, &TDA7419_Para[8], 1);
+}
+
+static VOID Tda7419_Bass(P_FLY_TDA7419_INFO pTda7419Info, BYTE BassFreq, BYTE BassLevel)
+{
+	BYTE temp;
+	if(BassFreq > 2)
+		BassFreq = 2;
+	if(BassLevel > 10)
+		BassLevel = 10;
+	//设置频点
+	temp = TDA7419_Para[6] & 0xE0;
+	temp = temp | Treble_Middle_Bass_Mask[BassLevel];
+	TDA7419_Para[6] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x06, &TDA7419_Para[6], 1);
+	//设置频率
+	temp = TDA7419_Para[8] & 0xCF;
+	temp = temp | (BassFreq << 4);
+	TDA7419_Para[8] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x08, &TDA7419_Para[8], 1);
+}
+
+static VOID Tda7419_Mid(P_FLY_TDA7419_INFO pTda7419Info, BYTE MidFreq, BYTE MidLevel)
+{
+	BYTE temp;
+	if(MidFreq > 2)
+		MidFreq = 2;
+	if(MidLevel > 10)
+		MidLevel = 10;
+	//设置频点
+	temp = TDA7419_Para[5] & 0xE0;
+	temp = temp | Treble_Middle_Bass_Mask[MidLevel];
+	TDA7419_Para[5] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x05, &TDA7419_Para[5], 1);
+	//设置频率
+	temp = TDA7419_Para[8] & 0xF3;
+	temp = temp | (MidFreq << 2);
+	TDA7419_Para[8] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x08, &TDA7419_Para[8], 1);	
+}
+
+static VOID Tda7419_Treble(P_FLY_TDA7419_INFO pTda7419Info, BYTE TrebFreq, BYTE TrebLevel)
+{
+	BYTE temp;
+	if(TrebFreq > 1)
+		TrebFreq = 1;
+	if(TrebLevel > 10) 
+		TrebLevel = 10;
+
+	temp = TDA7419_Para[4] & 0x80;
+	temp = temp | (TrebFreq << 5) | Treble_Middle_Bass_Mask[TrebLevel] | 0x80;
+	//temp = TDA7419_Para[4] & 0x00;
+	//temp = temp | (TrebFreq << 5) | Treble_Middle_Bass_Mask[TrebLevel] | 0x00;
+	TDA7419_Para[4] = temp;
+	I2C_Write_Tda7419(pTda7419Info, 0x04, &TDA7419_Para[4], 1);
+}
+
+
+
+static VOID TDA7419_Balance_Fader(P_FLY_TDA7419_INFO pTda7419Info, BYTE ibalance, BYTE iFader)
+{
+	BYTE temp;
+	if(ibalance > 20)ibalance = 20;
+	if(iFader > 20)iFader = 20;
+	//LF
+	if(ibalance <= 10 && iFader <= 10)
+	{
+		TDA7419_Para[0x0A] = Balance_Fader_Mask[0];	
+	}
+	else
+	{
+		temp = LARGER(ibalance,iFader);
+		temp = temp - 10;
+		TDA7419_Para[0x0A] = Balance_Fader_Mask[temp];	
+	}
+	//RF
+	if(ibalance >= 10 && iFader <= 10)
+	{
+		TDA7419_Para[0x0B] = Balance_Fader_Mask[0];
+	}
+	else
+	{
+		temp = LARGER((20-ibalance),iFader);
+		temp = temp - 10;
+		TDA7419_Para[0x0B] = Balance_Fader_Mask[temp];	
+	}
+	//LR
+	if(ibalance <= 10 && iFader >= 10)
+	{
+		TDA7419_Para[0x0C] = Balance_Fader_Mask[0];
+	}
+	else
+	{
+		temp = LARGER(ibalance,(20-iFader));
+		temp = temp - 10;
+		TDA7419_Para[0x0C] = Balance_Fader_Mask[temp];	
+	}
+	//RR
+	if(ibalance >= 10 && iFader >= 10)
+	{
+		TDA7419_Para[0x0D] = Balance_Fader_Mask[0];
+	}
+	else
+	{
+		temp = LARGER((20-ibalance),(20-iFader));
+		temp = temp - 10;
+		TDA7419_Para[0x0D] = Balance_Fader_Mask[temp];	
+	}
+	I2C_Write_Tda7419(pTda7419Info, 0x0A, &TDA7419_Para[10], 1);
+	I2C_Write_Tda7419(pTda7419Info, 0x0B, &TDA7419_Para[11], 1);
+	I2C_Write_Tda7419(pTda7419Info, 0x0C, &TDA7419_Para[12], 1);
+	I2C_Write_Tda7419(pTda7419Info, 0x0D, &TDA7419_Para[13], 1);
+}
+
+static VOID Tda7419PutToBuff(P_FLY_TDA7419_INFO pTda7419Info,BYTE data)
+{
+	pTda7419Info->buffToUser[pTda7419Info->buffToUserHx++] = data;
+	if (pTda7419Info->buffToUserHx >= DATA_BUFF_LENGTH_TO_USER)
+	{
+		pTda7419Info->buffToUserHx = 0;
+	}
+	if (pTda7419Info->buffToUserHx == pTda7419Info->buffToUserLx)
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\n\r\n\r\nFlyAudio 7419 Buff to user overflow!!!\r\n\r\n\r\n")));)
+	}
+}
+
+static VOID Tda7419ReturnToUser(P_FLY_TDA7419_INFO pTda7419Info,BYTE *buf,UINT len)
+{
+	BYTE crc;
+	UINT i;
+	{
+		DBG3(RETAILMSG(1, (TEXT("\r\nFlyAudio 7419 return WinCE:")));)
+		for (i = 0;i < len;i++)
+		{
+			DBG3(RETAILMSG(1, (TEXT(" %X"),buf[i]));)
+		}
+	}	
+	EnterCriticalSection(&pTda7419Info->hCSSendToUser);
+	Tda7419PutToBuff(pTda7419Info,0xFF);
+	Tda7419PutToBuff(pTda7419Info,0x55);
+	Tda7419PutToBuff(pTda7419Info,len+1);
+	crc = len + 1;
+	for(i = 0;i < len;i++)
+	{
+		Tda7419PutToBuff(pTda7419Info,buf[i]);
+		crc += buf[i];
+	}
+	Tda7419PutToBuff(pTda7419Info,crc);
+	SetEvent(pTda7419Info->hBuffToUserDataEvent);
+	LeaveCriticalSection(&pTda7419Info->hCSSendToUser);
+}
+
+void returnAudioPowerMode(P_FLY_TDA7419_INFO pTda7419Info,BOOL bPower)
+{
+	BYTE buf[] = {0x01,0x00};
+	if (bPower)
+	{
+		buf[1] = 0x01;
+	}
+	else
+	{
+		buf[1] = 0x00;
+	}
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudiobInit(P_FLY_TDA7419_INFO pTda7419Info,BOOL bInit)
+{
+	BYTE buf[] = {0x02,0x00};
+	if (bInit)
+	{
+		buf[1] = 0x01;
+	}
+	else
+	{
+		buf[1] = 0x00;
+	}
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainInput(P_FLY_TDA7419_INFO pTda7419Info,BYTE iInput)
+{
+	BYTE buf[] = {0x10,0x00};
+	buf[1] = iInput;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainMute(P_FLY_TDA7419_INFO pTda7419Info,BOOL bMute)
+{
+	BYTE buf[] = {0x11,0x00};
+	if (bMute)
+	{
+		buf[1] = 0x01;
+	}
+	else
+	{
+		buf[1] = 0x00;
+	}
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainVolume(P_FLY_TDA7419_INFO pTda7419Info,BYTE iVolume)
+{
+	BYTE buf[] = {0x12,0x00};
+	buf[1] = iVolume;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainBalance(P_FLY_TDA7419_INFO pTda7419Info,BYTE iBalance)
+{
+	BYTE buf[] = {0x13,0x00};
+	buf[1] = iBalance;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainFader(P_FLY_TDA7419_INFO pTda7419Info,BYTE iFader)
+{
+	BYTE buf[] = {0x14,0x00};
+	buf[1] = iFader;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainTrebFreq(P_FLY_TDA7419_INFO pTda7419Info,BYTE iTrebFreq)
+{
+	BYTE buf[] = {0x15,0x00};
+	buf[1] = iTrebFreq;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainTrebLevel(P_FLY_TDA7419_INFO pTda7419Info,BYTE iTrebLevel)
+{
+	BYTE buf[] = {0x16,0x00};
+	buf[1] = iTrebLevel;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainMidFreq(P_FLY_TDA7419_INFO pTda7419Info,BYTE iMidFreq)
+{
+	BYTE buf[] = {0x17,0x00};
+	buf[1] = iMidFreq;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainMidLevel(P_FLY_TDA7419_INFO pTda7419Info,BYTE iMidLevel)
+{
+	BYTE buf[] = {0x18,0x00};
+	buf[1] = iMidLevel;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainBassFreq(P_FLY_TDA7419_INFO pTda7419Info,BYTE iBassFreq)
+{
+	BYTE buf[] = {0x19,0x00};
+	buf[1] = iBassFreq;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainBassLevel(P_FLY_TDA7419_INFO pTda7419Info,BYTE iBassLevel)
+{
+	BYTE buf[] = {0x1A,0x00};
+	buf[1] = iBassLevel;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainLoudnessFreq(P_FLY_TDA7419_INFO pTda7419Info,BYTE iLoudnessFreq)
+{
+	BYTE buf[] = {0x1B,0x00};
+	buf[1] = iLoudnessFreq;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainLoudnessLevel(P_FLY_TDA7419_INFO pTda7419Info,BYTE iLoudnessLevel)
+{
+	BYTE buf[] = {0x1C,0x00};
+	buf[1] = iLoudnessLevel;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainSimEQ(P_FLY_TDA7419_INFO pTda7419Info,BYTE iSimEQ)
+{
+	BYTE buf[] = {0x21,0x00};
+	buf[1] = iSimEQ;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainLoudnessOn(P_FLY_TDA7419_INFO pTda7419Info,BOOL bLoudnessOn)
+{
+	BYTE buf[] = {0x30,0x00};
+	if (bLoudnessOn)
+	{
+		buf[1] = 0x01;
+	} 
+	else
+	{
+		buf[1] = 0x00;
+	}
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainSubOn(P_FLY_TDA7419_INFO pTda7419Info,BOOL bSubOn)
+{
+	BYTE buf[] = {0x31,0x00};
+	if (bSubOn)
+	{
+		buf[1] = 0x01;
+	} 
+	else
+	{
+		buf[1] = 0x00;
+	}
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainSubFilter(P_FLY_TDA7419_INFO pTda7419Info,BYTE iSubFilter)
+{
+	BYTE buf[] = {0x32,0x00};
+	buf[1] = iSubFilter;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+void returnAudioMainSubLevel(P_FLY_TDA7419_INFO pTda7419Info,BYTE iSubLevel)
+{
+	BYTE buf[] = {0x33,0x00};
+	buf[1] = iSubLevel;
+
+	Tda7419ReturnToUser(pTda7419Info,buf,2);
+}
+
+//void returnAudioEQAll(P_FLY_TDA7419_INFO pTda7419Info,BYTE *p)
+//{
+//	BYTE buf[10];
+//	buf[0] = 0x0B;
+//	memcpy(&buf[1],p,9);
+//
+//	Tda7419ReturnToUser(pTda7419Info,buf,10);
+//}
+
+void Tda7419_ReadReg(P_FLY_TDA7419_INFO pTda7419Info,UCHAR regAddr)
+{		
+	BYTE Tda7419Reg[27];
+	I2C_Read_Tda7419(pTda7419Info, regAddr, &Tda7419Reg[2], 24);
+
+	DBG3(RETAILMSG(1, (TEXT("FlyAudio Tda7419 REG[%X] is :"),regAddr));)
+	for(int i=0;i<24;i++)
+	{
+		DBG3(RETAILMSG(1, (TEXT(" %X"),Tda7419Reg[2+i]));)
+	}
+	Tda7419Reg[0]=0xfe;
+	Tda7419Reg[1]=0xaa;
+	Tda7419ReturnToUser(pTda7419Info,Tda7419Reg,26);
+}
+
+static VOID DealWinceCmd(P_FLY_TDA7419_INFO pTda7419Info,BYTE *buf,UINT len)
+{
+	UINT i;
+	DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 WinCE CMD:")));)
+	for (i = 0;i < len;i++)
+	{
+		DBG2(RETAILMSG(1, (TEXT(" %X"),buf[i]));)
+	}
+
+	switch(buf[0])
+	{
+	case 0x01:
+		if (0x01 == buf[1])
+		{
+			returnAudioMainInput(pTda7419Info,pTda7419Info->FlyAudioInfo.preMainAudioInput);
+			returnAudioMainBalance(pTda7419Info,pTda7419Info->FlyAudioInfo.preBalance);
+			returnAudioMainFader(pTda7419Info,pTda7419Info->FlyAudioInfo.preFader);
+			returnAudioMainTrebFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preTrebleFreq);
+			returnAudioMainTrebLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preTrebleLevel);
+			returnAudioMainMidFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preMidFreq);
+			returnAudioMainMidLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preMidLevel);
+			returnAudioMainBassFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preBassFreq);
+			returnAudioMainBassLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preBassLevel);
+			returnAudioMainLoudnessFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preLoudFreq);
+			returnAudioMainLoudnessLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preLoudLevel);
+			returnAudioMainLoudnessOn(pTda7419Info,pTda7419Info->FlyAudioInfo.preLoudnessOn);
+			returnAudioMainSubOn(pTda7419Info,pTda7419Info->FlyAudioInfo.preSubOn);
+			returnAudioMainSubFilter(pTda7419Info,pTda7419Info->FlyAudioInfo.preSubFilter);
+			returnAudioMainSubLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preSubLevel);
+
+			returnAudioMainSimEQ(pTda7419Info,pTda7419Info->FlyAudioInfo.preSimEQ);
+
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeAudioSleep = TRUE;
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeAudioSleep = FALSE;
+
+			returnAudioPowerMode(pTda7419Info,TRUE);
+			pTda7419Info->bPowerUp = TRUE;
+			pTda7419Info->bNeedInit = TRUE;
+			SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+		}
+		else if (0x00 == buf[1])
+		{
+			returnAudioPowerMode(pTda7419Info,FALSE);
+		}
+		break;
+	case 0x03:
+		if (0x01 == buf[1])
+		{
+			if (pTda7419Info->FlyAudioInfo.preMainMute)
+			{
+				pTda7419Info->FlyAudioInfo.preMainMute = FALSE;
+				pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = FALSE;
+			} 
+			else
+			{
+				pTda7419Info->FlyAudioInfo.preMainMute = TRUE;
+				pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = TRUE;
+			}
+			eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_DATA_CHANGE_VOLUME);
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 MainMute %d"),pTda7419Info->FlyAudioInfo.preMainMute));)
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainMute(pTda7419Info,pTda7419Info->FlyAudioInfo.preMainMute);
+			}
+		}
+		else if (0x02 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preBalance++;
+			if (pTda7419Info->FlyAudioInfo.preBalance >= BALANCE_LEVEL_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preBalance = BALANCE_LEVEL_COUNT-1;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainBalance(pTda7419Info,pTda7419Info->FlyAudioInfo.preBalance);
+			}
+		}
+		else if (0x03 == buf[1])
+		{
+			if (pTda7419Info->FlyAudioInfo.preBalance)
+			{
+				pTda7419Info->FlyAudioInfo.preBalance--;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainBalance(pTda7419Info,pTda7419Info->FlyAudioInfo.preBalance);
+			}
+		}
+		else if (0x04 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preFader++;
+			if (pTda7419Info->FlyAudioInfo.preFader >= FADER_LEVEL_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preFader = FADER_LEVEL_COUNT-1;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainFader(pTda7419Info,pTda7419Info->FlyAudioInfo.preFader);
+			}
+		}
+		else if (0x05 == buf[1])
+		{
+			if (pTda7419Info->FlyAudioInfo.preFader)
+			{
+				pTda7419Info->FlyAudioInfo.preFader--;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainFader(pTda7419Info,pTda7419Info->FlyAudioInfo.preFader);
+			}
+		}
+		else if (0x06 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			pTda7419Info->FlyAudioInfo.preTrebleFreq++;
+			if (pTda7419Info->FlyAudioInfo.preTrebleFreq >= TREB_FREQ_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preTrebleFreq = 0;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainTrebFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preTrebleFreq);
+			}
+		}
+		else if (0x07 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			pTda7419Info->FlyAudioInfo.preTrebleLevel++;
+			if (pTda7419Info->FlyAudioInfo.preTrebleLevel >= TREB_LEVEL_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preTrebleLevel = TREB_LEVEL_COUNT-1;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainTrebLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preTrebleLevel);
+			}
+		}
+		else if (0x08 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			if (pTda7419Info->FlyAudioInfo.preTrebleLevel)
+			{
+				pTda7419Info->FlyAudioInfo.preTrebleLevel--;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainTrebLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preTrebleLevel);
+			}
+		}
+		else if (0x09 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			pTda7419Info->FlyAudioInfo.preMidFreq++;
+			if (pTda7419Info->FlyAudioInfo.preMidFreq >= MID_FREQ_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preMidFreq = 0;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainMidFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preMidFreq);
+			}
+		}
+		else if (0x0A == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			pTda7419Info->FlyAudioInfo.preMidLevel++;
+			if (pTda7419Info->FlyAudioInfo.preMidLevel >= MID_LEVEL_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preMidLevel = MID_LEVEL_COUNT-1;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainMidLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preMidLevel);
+			}
+		}
+		else if (0x0B == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			if (pTda7419Info->FlyAudioInfo.preMidLevel)
+			{
+				pTda7419Info->FlyAudioInfo.preMidLevel--;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainMidLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preMidLevel);
+			}
+		}
+		else if (0x0C == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			pTda7419Info->FlyAudioInfo.preBassFreq++;
+			if (pTda7419Info->FlyAudioInfo.preBassFreq >= BASS_FREQ_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preBassFreq = 0;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainBassFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preBassFreq);
+			}
+		}
+		else if (0x0D == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			pTda7419Info->FlyAudioInfo.preBassLevel++;
+			if (pTda7419Info->FlyAudioInfo.preBassLevel >= BASS_LEVEL_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preBassLevel = BASS_LEVEL_COUNT-1;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainBassLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preBassLevel);
+			}
+		}
+		else if (0x0E == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+			if (pTda7419Info->FlyAudioInfo.preBassLevel)
+			{
+				pTda7419Info->FlyAudioInfo.preBassLevel--;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainBassLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preBassLevel);
+			}
+		}
+		else if (0x0F == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preLoudFreq++;
+			if (pTda7419Info->FlyAudioInfo.preLoudFreq >= LOUDNESS_FREQ_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preLoudFreq = 0;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainLoudnessFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preLoudFreq);
+			}
+		}
+		else if (0x10 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preLoudLevel++;
+			if (pTda7419Info->FlyAudioInfo.preLoudLevel >= LOUDNESS_LEVEL_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preLoudLevel = LOUDNESS_LEVEL_COUNT-1;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainLoudnessLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preLoudLevel);
+			}
+		}
+		else if (0x11 == buf[1])
+		{
+			if (pTda7419Info->FlyAudioInfo.preLoudLevel)
+			{
+				pTda7419Info->FlyAudioInfo.preLoudLevel--;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainLoudnessLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preLoudLevel);
+			}
+		}
+		else if (0x12 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSubLevel++;
+			if (pTda7419Info->FlyAudioInfo.preSubLevel >= SUB_LEVEL_COUNT)
+			{
+				pTda7419Info->FlyAudioInfo.preSubLevel = SUB_LEVEL_COUNT-1;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainSubLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preSubLevel);
+			}
+		}
+		else if (0x13 == buf[1])
+		{
+			if (pTda7419Info->FlyAudioInfo.preSubLevel)
+			{
+				pTda7419Info->FlyAudioInfo.preSubLevel--;
+			}
+			if (pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				returnAudioMainSubLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preSubLevel);
+			}
+		}
+		break;
+	case 0x10:
+		pTda7419Info->FlyAudioInfo.preMainAudioInput = (audio_source)buf[1];
+		pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.eAudioInput = pTda7419Info->FlyAudioInfo.preMainAudioInput;
+		eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_RADIO_ANTENNA_ID);
+		eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_EXBOX_INPUT_CHANGE_ID);
+
+		DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 MainInput %d"),pTda7419Info->FlyAudioInfo.preMainAudioInput));)
+		if(pTda7419Info->bPowerUp)
+		{
+			SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+			Tda7419ReturnToUser(pTda7419Info,buf,len);
+		}
+		break;
+	case 0x11:
+		if(1 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preMainMute = TRUE;
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = TRUE;
+		}
+		else
+		{
+			pTda7419Info->FlyAudioInfo.preMainMute = FALSE;
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = FALSE;
+		}
+		eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_DATA_CHANGE_VOLUME);
+		DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 MainMute %d"),pTda7419Info->FlyAudioInfo.preMainMute));)
+		if(pTda7419Info->bPowerUp)
+		{
+			SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+			Tda7419ReturnToUser(pTda7419Info,buf,len);
+		}
+		break;
+	case 0x12:
+		if (buf[1] <= 60)
+		{
+			pTda7419Info->FlyAudioInfo.preMainVolume = buf[1];
+			pTda7419Info->FlyAudioInfo.preMainMute = FALSE;
+#if GLOBAL_COMM
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume = buf[1];
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = FALSE;
+#endif
+			eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_DATA_CHANGE_VOLUME);
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 MainVolume %d"),pTda7419Info->FlyAudioInfo.preMainVolume));)
+			if(pTda7419Info->bPowerUp)
+			{
+				//pTda7419Info->FlyAudioInfo.preMainMute = FALSE;
+				//pTda7419Info->FlyAudioInfo.curMainMute = FALSE;
+				//Tda7419_Mute(pTda7419Info, FALSE);
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x13:
+		if (buf[1] < BALANCE_LEVEL_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preBalance = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Balance %d"),pTda7419Info->FlyAudioInfo.preBalance));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x14:
+		if (buf[1] < FADER_LEVEL_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preFader = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Fader %d"),pTda7419Info->FlyAudioInfo.preFader));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x15:
+		pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+		if (buf[1] < TREB_FREQ_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preTrebleFreq = buf[1];
+			//pTda7419Info->FlyAudioInfo.preTrebleLevel = buf[2];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Treble Freq %d"),pTda7419Info->FlyAudioInfo.preTrebleFreq));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x16:
+		pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+		if (buf[1] < TREB_LEVEL_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preTrebleLevel = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Treble Level %d"),pTda7419Info->FlyAudioInfo.preTrebleLevel));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+
+	case 0x17:
+		pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+		if (buf[1] < MID_FREQ_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preMidFreq = buf[1];
+			//pTda7419Info->FlyAudioInfo.preMidLevel = buf[2];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Mid Freq %d"),pTda7419Info->FlyAudioInfo.preMidFreq));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+    case 0x18:
+		pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+	    if (buf[1] < MID_LEVEL_COUNT)
+	    {
+			pTda7419Info->FlyAudioInfo.preMidLevel = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Mid Level %d"),pTda7419Info->FlyAudioInfo.preMidLevel));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x19 :
+		pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+		if (buf[1] < BASS_FREQ_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preBassFreq = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Bass Freq %d"),pTda7419Info->FlyAudioInfo.preBassFreq));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x1A:
+		pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+		if (buf[1] < BASS_LEVEL_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preBassLevel = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Bass Level %d"),pTda7419Info->FlyAudioInfo.preBassLevel));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x1B:
+		if (buf[1] < LOUDNESS_FREQ_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preLoudFreq = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Loud Freq %d"),pTda7419Info->FlyAudioInfo.preLoudFreq));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x1C:
+		if (buf[1] < LOUDNESS_LEVEL_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preLoudLevel = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Loud Level %d"),pTda7419Info->FlyAudioInfo.preLoudLevel));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x21:
+		pTda7419Info->FlyAudioInfo.preSimEQ = buf[1];
+		if (0x01 == buf[1])//缺省
+		{
+			pTda7419Info->FlyAudioInfo.preTrebleFreq = 0;
+			pTda7419Info->FlyAudioInfo.preTrebleLevel = 5;
+			pTda7419Info->FlyAudioInfo.preMidFreq = 0;
+			pTda7419Info->FlyAudioInfo.preMidLevel = 5;
+			pTda7419Info->FlyAudioInfo.preBassFreq = 0;
+			pTda7419Info->FlyAudioInfo.preBassLevel = 5;
+		}
+		else if (0x02 == buf[1])//古典
+		{
+			pTda7419Info->FlyAudioInfo.preTrebleFreq = 1;
+			pTda7419Info->FlyAudioInfo.preTrebleLevel = 9;
+			pTda7419Info->FlyAudioInfo.preMidFreq = 0;
+			pTda7419Info->FlyAudioInfo.preMidLevel = 3;
+			pTda7419Info->FlyAudioInfo.preBassFreq = 0;
+			pTda7419Info->FlyAudioInfo.preBassLevel = 10;
+		}
+		else if (0x03 == buf[1])//流行
+		{
+			pTda7419Info->FlyAudioInfo.preTrebleFreq = 0;
+			pTda7419Info->FlyAudioInfo.preTrebleLevel = 7;
+			pTda7419Info->FlyAudioInfo.preMidFreq = 1;
+			pTda7419Info->FlyAudioInfo.preMidLevel = 6;
+			pTda7419Info->FlyAudioInfo.preBassFreq = 1;
+			pTda7419Info->FlyAudioInfo.preBassLevel = 7;
+		}
+		else if (0x04 == buf[1])//摇滚
+		{
+			pTda7419Info->FlyAudioInfo.preTrebleFreq = 0;
+			pTda7419Info->FlyAudioInfo.preTrebleLevel = 8;
+			pTda7419Info->FlyAudioInfo.preMidFreq = 0;
+			pTda7419Info->FlyAudioInfo.preMidLevel = 4;
+			pTda7419Info->FlyAudioInfo.preBassFreq = 0;
+			pTda7419Info->FlyAudioInfo.preBassLevel = 9;
+		}
+		else if (0x05 == buf[1])//爵士
+		{
+			pTda7419Info->FlyAudioInfo.preTrebleFreq = 1;
+			pTda7419Info->FlyAudioInfo.preTrebleLevel = 8;
+			pTda7419Info->FlyAudioInfo.preMidFreq = 1;
+			pTda7419Info->FlyAudioInfo.preMidLevel = 5;
+			pTda7419Info->FlyAudioInfo.preBassFreq = 1;
+			pTda7419Info->FlyAudioInfo.preBassLevel = 8;
+		}
+		if(pTda7419Info->bPowerUp)
+		{
+			SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+			Tda7419ReturnToUser(pTda7419Info,buf,len);
+
+			returnAudioMainTrebFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preTrebleFreq);
+			returnAudioMainTrebLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preTrebleLevel);
+			returnAudioMainMidFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preMidFreq);
+			returnAudioMainMidLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preMidLevel);
+			returnAudioMainBassFreq(pTda7419Info,pTda7419Info->FlyAudioInfo.preBassFreq);
+			returnAudioMainBassLevel(pTda7419Info,pTda7419Info->FlyAudioInfo.preBassLevel);
+		}
+		break;
+	case 0x30:
+		if (0x01 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preLoudnessOn = TRUE;
+		} 
+		else
+		{
+			pTda7419Info->FlyAudioInfo.preLoudnessOn = FALSE;
+		}
+		if(pTda7419Info->bPowerUp)
+		{
+			SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+			Tda7419ReturnToUser(pTda7419Info,buf,len);
+		}
+		break;
+	case 0x31:
+		if (0x01 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preSubOn = TRUE;
+		} 
+		else
+		{
+			pTda7419Info->FlyAudioInfo.preSubOn = FALSE;
+		}
+		if(pTda7419Info->bPowerUp)
+		{
+			SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+			Tda7419ReturnToUser(pTda7419Info,buf,len);
+		}
+		break;
+	case 0x32:
+		if (buf[1] < SUB_FILTER_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preSubLevel = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Sub Filter %d"),pTda7419Info->FlyAudioInfo.preSubLevel));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x33:
+		if (buf[1] < SUB_LEVEL_COUNT)
+		{
+			pTda7419Info->FlyAudioInfo.preSubLevel = buf[1];
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Sub Level %d"),pTda7419Info->FlyAudioInfo.preSubLevel));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0x24:
+		if (0x01 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preGPSSpeaker = buf[1];
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.GPSSpeaker = buf[1];
+			DBG0(RETAILMSG(1, (TEXT("\r\nTda7419 GPSSpeaker %d"),pTda7419Info->FlyAudioInfo.preGPSSpeaker));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		else if (0x00 == buf[1])
+		{
+			pTda7419Info->FlyAudioInfo.preGPSSpeaker = buf[1];
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.GPSSpeaker = buf[1];
+			DBG0(RETAILMSG(1, (TEXT("\r\nTda7419 GPSSpeaker %d"),pTda7419Info->FlyAudioInfo.preGPSSpeaker));)
+			if(pTda7419Info->bPowerUp)
+			{
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				Tda7419ReturnToUser(pTda7419Info,buf,len);
+			}
+		}
+		break;
+	case 0xFF:
+		if (0x01 == buf[1])
+		{
+			FAU_PowerUp((DWORD)pTda7419Info);
+		} 
+		else if (0x00 == buf[1])
+		{
+			FAU_PowerDown((DWORD)pTda7419Info);
+		}
+		break;
+
+		//case 0xE0:
+		//	DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio Write To STM32 Test")));)
+		//	I2C_Write_STM32(pTda7419Info->Tda7419I2CHandle,buf[2],&buf[3],len-3);
+		//	break;
+		//case 0xE1:
+		//	DBG2(RETAILMSG(1, (TEXT("\r\nFlyAudio Read From STM32 Test")));)
+		//	I2C_Read_STM32(pTda7419Info->Tda7419I2CHandle,buf[2],&buf[3],len-3);
+		//	Tda7419ReturnToUser(pTda7419Info,buf,len);
+		//	break;
+	default:
+		DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 user command unhandle %X"),buf[0]));)
+		break;
+	}
+	//case 0xfe:
+	//	if(buf[1] == 0x55)
+	//	{
+	//		pTda7419Info->FlyAudioInfo.ReadRegFlag = TRUE;
+	//		pTda7419Info->FlyAudioInfo.preReadReg = (buf[2] << 16) + (buf[3] << 8) + buf[4];
+	//		DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 ReadReg Addr %X"),pTda7419Info->FlyAudioInfo.preReadReg));)
+	//		if(pTda7419Info->bPowerUp)
+	//		{
+	//			SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+	//		}
+	//	}
+	//	break;
+}
+
+//#define ADSP_X_Gsa_Bar321                          0x3C070D//0x0D073C//
+//#define ADSP_X_Gsa_Bar654                          0x3B070D//0x0D073B//
+//#define ADSP_X_Gsa_Bar987                          0x3A070D//0x0D073A//
+
+//void Tda7419_ReadGraphicalSpectrumAnalyzer(P_FLY_Tda7419_INFO pTda7419Info)//寄存器地址，字节MSB，Prima先传低字节,7419先接受高字节
+//{
+//	BYTE Value[3];//7419先发高字节，Prima先存低字节
+//	BYTE commandValue[] = {0x01,0xF0,1,2,3,4,5,6,7,8,9};
+//	return;
+//	I2C_Read_Tda7419(pTda7419Info, ADSP_X_Gsa_Bar321, Value, 3);
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[0] = Value[2];
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[1] = Value[1];
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[2] = Value[0];
+//	Sleep(10);
+//	I2C_Read_Tda7419(pTda7419Info, ADSP_X_Gsa_Bar654, Value, 3);
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[3] = Value[2];
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[4] = Value[1];
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[5] = Value[0];
+//	Sleep(10);
+//	I2C_Read_Tda7419(pTda7419Info, ADSP_X_Gsa_Bar987, Value, 3);
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[6] = Value[2];
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[7] = Value[1];
+//	pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[8] = Value[0];
+//	Sleep(10);
+//	memcpy((VOID *)&commandValue[2],(VOID *)&pTda7419Info->FlyAudioInfo.GraphicalSpectrumAnalyzerValue[0],9);
+//	Tda7419ReturnToUser(pTda7419Info,commandValue,11);
+//}
+
+//bDelayOn为TRUE时，iDelayStage慢慢递增
+void volumeFaderInOut(P_FLY_TDA7419_INFO pTda7419Info,BOOL bEnable)
+{
+	if (bEnable)
+	{
+		pTda7419Info->FlyAudioInfo.bEnableVolumeFader = TRUE;
+	}
+	else
+	{
+		pTda7419Info->FlyAudioInfo.bEnableVolumeFader = FALSE;
+	}
+}
+/****************************************************************/
+/**	                 Write data to MCU			               **/
+/****************************************************************/
+void writeDataToMcu(P_FLY_TDA7419_INFO pTda7419Info,BYTE *p,UINT length)
+{
+	UINT i;
+	if (pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.bInit)
+	{
+		if(FALSE == WriteMsgQueue(pTda7419Info->hMsgQueueFromExtAmpCreate, p, length, 0, 0))
+		{
+			DWORD dwError = GetLastError();
+			DBG0(RETAILMSG(1, (TEXT("\r\nExtAmp Write MsgQueue To CarBody Error!0x%x"),dwError));)
+				switch(dwError)
+			{
+				case ERROR_INSUFFICIENT_BUFFER:
+					DBG0(RETAILMSG(1, (TEXT("\r\nExtAmp Write MsgQueue To CarBody Error-ERROR_INSUFFICIENT_BUFFER")));)
+						break;
+				case ERROR_OUTOFMEMORY:
+					DBG0(RETAILMSG(1, (TEXT("\r\nExtAmp Write MsgQueue To CarBody Error-ERROR_OUTOFMEMORY")));)
+						break;				
+				case ERROR_PIPE_NOT_CONNECTED:
+					DBG0(RETAILMSG(1, (TEXT("\r\nExtAmp Write MsgQueue To CarBody Error-ERROR_PIPE_NOT_CONNECTED")));)
+						break;
+				case ERROR_TIMEOUT:
+					DBG0(RETAILMSG(1, (TEXT("\r\nExtAmp Write MsgQueue To CarBody Error!ERROR_TIMEOUT")));)
+						break;
+				default:
+					DBG0(RETAILMSG(1, (TEXT("\r\nExtAmp Write MsgQueue To CarBody Error!-unknow error")));)
+						break;
+			}				 
+
+		}
+	}
+	else
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nExtAmp Write MsgQueue To CarBody Not Init")));)
+			for (i = 0;i < length;i++)
+			{
+				DBG0(RETAILMSG(1, (TEXT(" %x"),p[i]));)
+			}
+	}
+}
+/****************************************************************/
+/**	                 Read data From MCU			               **/
+/****************************************************************/
+static DWORD WINAPI ThreadExtAmpRead(LPVOID pContext)
+{
+	P_FLY_TDA7419_INFO pTda7419Info = (P_FLY_TDA7419_INFO)pContext;
+	ULONG WaitReturn;
+	BYTE buff[FLY_MSG_QUEUE_TO_EXTAMP_LENGTH];
+	DWORD dwRes;
+	DWORD dwMsgFlag;
+
+	while (!pTda7419Info->bKillDispatchFlyMsgQueueExtAmpReadThread)
+	{
+		WaitReturn = WaitForSingleObject(pTda7419Info->hMsgQueueToExtAmpCreate, INFINITE);
+		if (WAIT_FAILED == WaitReturn)
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio ExtAmp ThreadRead Event hMsgQueueToExtAmp Open Error")));)
+		}
+		ReadMsgQueue(pTda7419Info->hMsgQueueToExtAmpCreate, buff, FLY_MSG_QUEUE_TO_EXTAMP_LENGTH, &dwRes, 0, &dwMsgFlag);
+
+		if(dwRes)
+		{
+			DBG2(RETAILMSG(1, (TEXT("ExtAmp Read MsgQueue%d %x %x"),dwRes,buff[0],buff[1]));)
+				switch (buff[0])
+			{		
+				case 0x01:
+					if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bCheckShellBabyError)
+					{
+						break;
+					}
+					if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable
+						&& pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackActiveNow)
+					{
+						break;
+					}
+					if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute)
+					{
+						pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = FALSE;
+						pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume = 0;
+					}
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume =buff[1];						
+					if (0 == pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume)
+					{
+						pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = TRUE;
+					}
+					eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_DATA_CHANGE_VOLUME);	
+					break;
+				case 0x02:
+					if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable
+						&& pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackActiveNow)
+					{
+						break;
+					}
+					if (0x00 == buff[1])
+					{
+						pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = FALSE;
+					}
+					else if (0x01 == buff[1])
+					{
+						pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = TRUE;
+					}
+					if (0 == pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume)
+					{
+						pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = TRUE;
+					}
+					eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_DATA_CHANGE_VOLUME);
+					break;
+				case 0x89:
+					if(0xFA == buff[1])
+					{
+						pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveFlyAudioExtAMP=TRUE;
+						if (pTda7419Info->bPowerUp)
+						{
+							SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+						}
+						FA8200LowVoltageRecovery(pTda7419Info);
+						DBG2(RETAILMSG(1, (TEXT("\r\nFlyaudio amplifier exists!!!")));)
+					}
+					break;
+				default:
+					DBG3(RETAILMSG(1, (TEXT("\r\nFlyAudio ExtAmp ThreadRead Unhandle%d %x %x"),dwRes,buff[0],buff[1]));)
+						break;
+			}
+		}
+	}
+	DBG1(RETAILMSG(1, (TEXT("\r\nFlyAudio ExtAmp ThreadRead exit")));)
+		pTda7419Info->FLyMsgQueueExtAmpReadThreadHandle = NULL;
+	return 0;
+}
+
+BOOL bVolumeFaderInOut(P_FLY_TDA7419_INFO pTda7419Info)
+{
+	return pTda7419Info->FlyAudioInfo.bEnableVolumeFader;
+}
+
+static DWORD WINAPI Tda7419DelayThread(LPVOID pContext)
+{
+	P_FLY_TDA7419_INFO pTda7419Info = (P_FLY_TDA7419_INFO)pContext;
+	ULONG WaitReturn;
+	BOOL bDelayOn = FALSE;BYTE iDelayStage = 0;BOOL bDelayEnough = FALSE;UINT iDelayTime = 100;DWORD iLastTime,iNowTime;
+	BOOL bMute = FALSE;
+	UINT i;
+
+	while (!pTda7419Info->bKillDispatchTda7419DelayThread)
+	{
+		if (bDelayOn)//处理任务中
+		{
+			iNowTime = GetTickCount();
+			if (iNowTime - iLastTime < iDelayTime)
+			{
+				WaitReturn = WaitForSingleObject(pTda7419Info->hDispatchTda7419DelayThreadEvent, iDelayTime - (iNowTime - iLastTime));
+			}
+			else
+			{
+				bDelayEnough = TRUE;
+			}
+			if (!bDelayEnough)//补充
+			{
+				iNowTime = GetTickCount();
+				if (iNowTime - iLastTime >= iDelayTime)
+				{
+					bDelayEnough = TRUE;
+				}
+			}
+		}
+		else
+		{
+			WaitReturn = WaitForSingleObject(pTda7419Info->hDispatchTda7419DelayThreadEvent, INFINITE);
+		}
+		RETAILMSG(1, (TEXT("\r\nTda7419 X ON%dStep%dF%dT%dCV%dPV%d"),bDelayOn,iDelayStage,bDelayEnough,iDelayTime,pTda7419Info->FlyAudioInfo.curMainVolume,pTda7419Info->FlyAudioInfo.preMainVolume));
+		RETAILMSG(1, (TEXT("\r\n")));
+		for (i = 0;i < 18; i++)
+		{
+			RETAILMSG(1, (TEXT(" %x"),TDA7419_Para[i]));
+		}
+		if (FALSE == pTda7419Info->bPowerUp)//等待初始化
+		{
+			bDelayOn = FALSE;iDelayStage = 0;bDelayEnough = FALSE;iDelayTime = 100;iLastTime = GetTickCount();//跳过
+			DBG2(RETAILMSG(1, (TEXT("Wait PowerUp!")));)
+			continue;
+		}
+		
+		if(pTda7419Info->FlyAudioInfo.curMainAudioInput != pTda7419Info->FlyAudioInfo.tmpMainAudioInput)//切换通道
+		{
+			if (
+				(pTda7419Info->FlyAudioInfo.curMainAudioInput == MediaMP3 && pTda7419Info->FlyAudioInfo.tmpMainAudioInput == IPOD)
+				|| 
+				(pTda7419Info->FlyAudioInfo.curMainAudioInput == IPOD && pTda7419Info->FlyAudioInfo.tmpMainAudioInput == MediaMP3)
+				)
+			{
+				pTda7419Info->FlyAudioInfo.curMainAudioInput = pTda7419Info->FlyAudioInfo.tmpMainAudioInput;
+				pTda7419Info->FlyAudioInfo.dspMainAudioInput = pTda7419Info->FlyAudioInfo.tmpMainAudioInput;
+			}
+			else if (FALSE == bDelayOn || (bDelayOn && iDelayStage > 2))//启动
+			{
+				bDelayOn = TRUE;iDelayStage = 1;bDelayEnough = FALSE;iDelayTime = 100;iLastTime = GetTickCount();
+				volumeFaderInOut(pTda7419Info,TRUE);
+			}
+		}
+
+		if (1 == iDelayStage)
+		{
+			if (0)
+			//if (pTda7419Info->FlyAudioInfo.curGPSSpeaker)
+			{
+				Sleep(100);
+			}
+			else
+			{
+				DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 DelayThread MuteOn")));)
+				bDelayOn = TRUE;iDelayStage = 2;bDelayEnough = FALSE;iDelayTime = 314;iLastTime = GetTickCount();
+				if (FALSE == bMute)//静音
+				{
+					DBG2(RETAILMSG(1, (TEXT(" Run")));)
+					bMute = TRUE;
+					pTda7419Info->FlyAudioInfo.curMainMute = TRUE;
+					Tda7419_Mute(pTda7419Info,pTda7419Info->FlyAudioInfo.curMainMute);
+					pTda7419Info->FlyAudioInfo.curMainVolume = 0;
+					TDA7419_Volume(pTda7419Info,pTda7419Info->FlyAudioInfo.curMainVolume);
+				}
+			}
+		}
+		else if (2 == iDelayStage && bDelayEnough)//切换
+		{
+			bDelayOn = TRUE;iDelayStage = 3;bDelayEnough = FALSE;iDelayTime = 314;iLastTime = GetTickCount();
+
+			if (pTda7419Info->FlyAudioInfo.curMainAudioInput != pTda7419Info->FlyAudioInfo.tmpMainAudioInput)
+			{
+				DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 DelayThread ChangeInput%d"),pTda7419Info->FlyAudioInfo.tmpMainAudioInput));)
+				//独立音量控制
+				if (EXT_TEL == pTda7419Info->FlyAudioInfo.curMainAudioInput)//保存当前
+				{
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iExtTelVolume
+						= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume;
+				}
+				else if (BT == pTda7419Info->FlyAudioInfo.curMainAudioInput
+					|| BT_RING == pTda7419Info->FlyAudioInfo.curMainAudioInput)
+				{
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iBTCallVolume
+						= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume;
+				}
+				else
+				{
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iNormalVolume
+						= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume;
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNormalMute
+						= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute;
+				}
+
+				if (EXT_TEL == pTda7419Info->FlyAudioInfo.tmpMainAudioInput)//恢复以前
+				{
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume
+						= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iExtTelVolume;
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = FALSE;
+				}
+				else if (BT == pTda7419Info->FlyAudioInfo.tmpMainAudioInput
+					|| BT_RING == pTda7419Info->FlyAudioInfo.tmpMainAudioInput)
+				{
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume
+						= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iBTCallVolume;
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = FALSE;
+				}
+				else
+				{
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume
+						= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iNormalVolume;
+					pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute
+						= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNormalMute;
+				}
+
+				if (EXT_TEL == pTda7419Info->FlyAudioInfo.curMainAudioInput
+					|| BT == pTda7419Info->FlyAudioInfo.curMainAudioInput
+					|| BT_RING == pTda7419Info->FlyAudioInfo.curMainAudioInput
+
+					|| EXT_TEL == pTda7419Info->FlyAudioInfo.tmpMainAudioInput
+					|| BT == pTda7419Info->FlyAudioInfo.tmpMainAudioInput
+					|| BT_RING == pTda7419Info->FlyAudioInfo.tmpMainAudioInput)
+				{
+					eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_DATA_CHANGE_VOLUME);
+				}
+				//独立音量控制
+
+				pTda7419Info->FlyAudioInfo.curMainAudioInput = pTda7419Info->FlyAudioInfo.tmpMainAudioInput;
+				pTda7419Info->FlyAudioInfo.dspMainAudioInput = pTda7419Info->FlyAudioInfo.tmpMainAudioInput;
+
+				pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.eCurAudioInput = pTda7419Info->FlyAudioInfo.curMainAudioInput;
+
+				Tda7419_Input(pTda7419Info,pTda7419Info->FlyAudioInfo.curMainAudioInput,audioChannelGainTab[pTda7419Info->FlyAudioInfo.curMainAudioInput]);
+
+				//MasterSlaveAudioMainChannel(pTda7419Info,pTda7419Info->FlyAudioInfo.curMainAudioInput);
+				//设定恢复时间
+				if (iDelayTime < 618)
+				{
+					iDelayTime = 618;
+				}
+			}
+			//if(pTda7419Info->FlyAudioInfo.curPos != pTda7419Info->FlyAudioInfo.prePos)
+			//{
+			//	DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 DelayThread ChangePos")));)
+
+			//	pTda7419Info->FlyAudioInfo.curPos = pTda7419Info->FlyAudioInfo.prePos;
+			//	Tda7419_Pos_P(pTda7419Info,pTda7419Info->FlyAudioInfo.curPos);
+			//	//设定恢复时间
+			//	if (iDelayTime < 314)
+			//	{
+			//		iDelayTime = 314;
+			//	}
+			//}
+		}
+
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_RADIO_MUTE_IN_REQ_ID))//赋值
+		{
+			pTda7419Info->FlyAudioInfo.bMuteRadio = TRUE;
+		}
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_RADIO_MUTE_OUT_REQ_ID))//赋值
+		{
+			pTda7419Info->FlyAudioInfo.bMuteRadio = FALSE;
+		}
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_BT_MUTE_IN_REQ_ID))//赋值
+		{
+			pTda7419Info->FlyAudioInfo.bMuteBT = TRUE;
+		}
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_BT_MUTE_OUT_REQ_ID))//赋值
+		{
+			pTda7419Info->FlyAudioInfo.bMuteBT = FALSE;
+		}
+
+		if (pTda7419Info->FlyAudioInfo.bMuteRadio && pTda7419Info->FlyAudioInfo.curMainAudioInput == RADIO)//收音机静音
+		{
+			pTda7419Info->FlyAudioInfo.tmpMainMute = TRUE;
+		}
+		else if (pTda7419Info->FlyAudioInfo.bMuteBT && pTda7419Info->FlyAudioInfo.curMainAudioInput == BT)//蓝牙静音
+		{
+			pTda7419Info->FlyAudioInfo.tmpMainMute = TRUE;
+		}
+		else
+		{
+			pTda7419Info->FlyAudioInfo.tmpMainMute = pTda7419Info->FlyAudioInfo.preMainMute;
+		}
+
+		pTda7419Info->FlyAudioInfo.dspMainMute = pTda7419Info->FlyAudioInfo.tmpMainMute;
+
+		if(pTda7419Info->FlyAudioInfo.curMainMute != pTda7419Info->FlyAudioInfo.tmpMainMute)//直接静音控制
+		{
+			if (FALSE == bDelayOn || (bDelayEnough && 3 == iDelayStage))
+			{
+				DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 DelayThread MuteOff?%d"),pTda7419Info->FlyAudioInfo.tmpMainMute));)
+				bMute = FALSE;
+				pTda7419Info->FlyAudioInfo.curMainMute = pTda7419Info->FlyAudioInfo.tmpMainMute;
+				Tda7419_Mute(pTda7419Info,pTda7419Info->FlyAudioInfo.curMainMute);
+				if (pTda7419Info->FlyAudioInfo.curMainMute)
+				{
+					pTda7419Info->FlyAudioInfo.curMainVolume = 0;
+					TDA7419_Volume(pTda7419Info,pTda7419Info->FlyAudioInfo.curMainVolume);
+				}
+			}
+		}
+
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_SLEEP_PROC_AUDIO_ID))
+		{
+			eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_SLEEP_PROC_AUDIO_ID);
+			pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeAudioSleep
+				= pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeAudioSleep;			
+		}
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_RADIO_MUTE_IN_REQ_ID))//返回
+		{
+			eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_RADIO_MUTE_IN_REQ_ID);
+			Sleep(314);
+			eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_RADIO_MUTE_IN_OK_ID);
+		}
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_RADIO_MUTE_OUT_REQ_ID))
+		{
+			eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_RADIO_MUTE_OUT_REQ_ID);
+		}
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_BT_MUTE_IN_REQ_ID))//返回
+		{
+			eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_BT_MUTE_IN_REQ_ID);
+			Sleep(314);
+			eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_BT_MUTE_IN_OK_ID);
+		}
+		if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_BT_MUTE_OUT_REQ_ID))
+		{
+			eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_BT_MUTE_OUT_REQ_ID);
+		}
+
+		if(FALSE == pTda7419Info->FlyAudioInfo.curMainMute && pTda7419Info->FlyAudioInfo.curMainVolume != pTda7419Info->FlyAudioInfo.preMainVolume)
+		{
+			if (FALSE == bDelayOn || (bDelayEnough && 3 == iDelayStage))//静音后的恢复音量
+			{
+				if (bVolumeFaderInOut(pTda7419Info))
+				{
+					if (pTda7419Info->FlyAudioInfo.curMainVolume < pTda7419Info->FlyAudioInfo.preMainVolume)
+					{
+						pTda7419Info->FlyAudioInfo.curMainVolume++;
+						bDelayOn = TRUE;iDelayStage = 3;bDelayEnough = FALSE;iDelayTime = 30;iLastTime = GetTickCount();
+					}
+					else if (pTda7419Info->FlyAudioInfo.curMainVolume > pTda7419Info->FlyAudioInfo.preMainVolume)
+					{
+						pTda7419Info->FlyAudioInfo.curMainVolume--;
+						bDelayOn = TRUE;iDelayStage = 3;bDelayEnough = FALSE;iDelayTime = 30;iLastTime = GetTickCount();
+					}
+				}
+				else
+				{
+					pTda7419Info->FlyAudioInfo.curMainVolume = pTda7419Info->FlyAudioInfo.preMainVolume;
+				}
+
+				if (3 == iDelayStage
+					&& pTda7419Info->FlyAudioInfo.curMainVolume == pTda7419Info->FlyAudioInfo.preMainVolume)
+				{
+					iDelayStage = 4;//最后了
+					volumeFaderInOut(pTda7419Info,FALSE);
+				}
+
+				//if(pTda7419Info->FlyAudioInfo.curMainVolume != pTda7419Info->FlyAudioInfo.preMainVolume)
+				//{
+				//    pTda7419Info->FlyAudioInfo.curMainVolume = pTda7419Info->FlyAudioInfo.preMainVolume;   
+				//}
+
+				DBG1(RETAILMSG(1, (TEXT("\r\nTda7419 DelayThread Change Volume:%d"),pTda7419Info->FlyAudioInfo.curMainVolume));)
+				TDA7419_Volume(pTda7419Info,pTda7419Info->FlyAudioInfo.curMainVolume);
+			}
+		}
+		else
+		{
+			if (bDelayEnough && 3 == iDelayStage)
+			{
+				iDelayStage = 4;//最后了
+			}
+		}
+		
+		if (4 == iDelayStage)
+		{
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 DelayThread Finish")));)
+			bDelayOn = FALSE;iDelayStage = 0;bDelayEnough = FALSE;iDelayTime = 100;iLastTime = GetTickCount();
+		}
+
+		if (FALSE == bDelayOn)
+		{
+			if (
+				(MediaMP3 == pTda7419Info->FlyAudioInfo.tmpMainAudioInput
+				|| IPOD == pTda7419Info->FlyAudioInfo.tmpMainAudioInput)
+				)
+			{
+				pTda7419Info->FlyAudioInfo.tmpGPSSpeaker = 0;
+			}
+			else if (
+				BT_RING == pTda7419Info->FlyAudioInfo.tmpMainAudioInput
+				|| BT == pTda7419Info->FlyAudioInfo.tmpMainAudioInput
+				|| EXT_TEL == pTda7419Info->FlyAudioInfo.tmpMainAudioInput)//NaviMix处理逻辑
+			{
+				pTda7419Info->FlyAudioInfo.tmpGPSSpeaker = 0;
+			}
+			else if (pTda7419Info->FlyAudioInfo.preGPSSpeaker)
+			{
+				pTda7419Info->FlyAudioInfo.tmpGPSSpeaker = pTda7419Info->FlyAudioInfo.preMainVolume;
+			}
+			else
+			{
+				pTda7419Info->FlyAudioInfo.tmpGPSSpeaker = 0;
+			}
+			if (pTda7419Info->FlyAudioInfo.curGPSSpeaker != pTda7419Info->FlyAudioInfo.tmpGPSSpeaker)
+			{
+				pTda7419Info->FlyAudioInfo.curGPSSpeaker = pTda7419Info->FlyAudioInfo.tmpGPSSpeaker;
+				TDA7419_Navi_Mix(pTda7419Info,pTda7419Info->FlyAudioInfo.curGPSSpeaker);
+			}
+
+			pTda7419Info->FlyAudioInfo.dspGPSSpeaker = pTda7419Info->FlyAudioInfo.preGPSSpeaker;
+		}
+
+		/*******************************************************/
+		SetEvent(pTda7419Info->hDispatchExtAmpThreadEvent);
+		/*******************************************************/
+	}
+	pTda7419Info->Tda7419DelayThreadHandle = NULL;
+	DBG1(RETAILMSG(1, (TEXT("\r\nTda7419 DelayThread Exit")));)
+	return 0;
+}
+
+static DWORD WINAPI Tda7419MainThread(LPVOID pContext)
+{
+	P_FLY_TDA7419_INFO pTda7419Info = (P_FLY_TDA7419_INFO)pContext;
+	ULONG WaitReturn;
+
+	//BYTE Tda7419ID[4];
+	BYTE i;
+	BYTE Temp[18] = {1};
+
+	DBG1(RETAILMSG(1, (TEXT("\r\nTda7419 Tda7419MainThread Start")));)
+	while (!pTda7419Info->bKillDispatchTda7419MainThread)
+	{
+		WaitReturn = WaitForSingleObject(pTda7419Info->hDispatchTda7419MainThreadEvent, INFINITE);	
+		DBG1(RETAILMSG(1, (TEXT("\r\nTda7419 Tda7419MainThread Run")));)
+
+		if (FALSE == pTda7419Info->bPowerUp)
+		{
+		}
+		else
+		{
+			if (pTda7419Info->bNeedInit)
+			{
+				pTda7419Info->bNeedInit = FALSE;
+				//I2C_Read_Tda7419(pTda7419Info, 0x000000, Tda7419ID, 4);
+				//DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 ID is %X %X %X %X"),Tda7419ID[0],Tda7419ID[1],Tda7419ID[2],Tda7419ID[3]));)
+				//SendToTda7419NormalWriteData(pTda7419Info,Tda7419_Init_Data);
+
+				//SendToTda7419NormalWriteData(pTda7419Info,Tda7419_Init_Data1);//初始化参数1
+				//SendToTda7419NormalWriteData(pTda7419Info,Tda7419_Init_Data2);//初始化参数2
+				for(i = 0; i < 17; i++)
+				{
+					I2C_Write_Tda7419(pTda7419Info, i, &TDA7419_Para[i], 1);
+				}
+
+				//for (i = 0;i < 18; i++)
+				//{
+				//	I2C_Read_Tda7419(pTda7419Info, i, &Temp[i], 1);
+				//	DBG2(RETAILMSG(1, (TEXT("\r\nTda7419:I2C read %X %X"), i, Temp[i]));)
+				//}
+
+				//for(i = 0; i < 18; i++)
+				//{
+				//	I2C_Write_Tda7419(pTda7419Info, i, &TDA7741_Init_Data[i], 1);
+				//}
+
+				//for (i = 0;i < 18; i++)
+				//{
+				//	I2C_Read_Tda7419(pTda7419Info, i, &Temp[i], 1);
+				//	DBG2(RETAILMSG(1, (TEXT("\r\nTda7419:I2C read %X %X"), i, Temp[i]));)
+				//}
+
+				pTda7419Info->bPowerUp = TRUE;
+				pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable = TRUE;//音频芯片替其它驱动控制静音开关
+
+				returnAudiobInit(pTda7419Info,TRUE);
+
+				SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+				if (!pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bSilencePowerUp)
+				{
+					eventInterSetEvent(pTda7419Info,EVENT_GLOBAL_INNER_AMP_ON_ID);
+				}
+				Sleep(618);
+
+				pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iNeedProcVoltageShakeAudio = 80;//低电压
+
+				DBG1(RETAILMSG(1, (TEXT("\r\nTda7419 Init OK")));)
+			}
+
+			if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_BATTERY_RECOVERY_AUDIO_ID))
+			{
+				eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_BATTERY_RECOVERY_AUDIO_ID);
+				//FA8200LowVoltageRecovery(pTda7419Info);//由LPC做此检测
+			}
+
+			if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_SLEEP_PROC_AUDIO_ID))//待机要静音，静音完再清除这个标志
+			{
+				pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute = TRUE;
+			}
+
+			if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_DATA_CHANGE_VOLUME))
+			{
+				eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_DATA_CHANGE_VOLUME);
+				if (pTda7419Info->FlyAudioInfo.preMainMute != pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute)//全局
+				{
+					pTda7419Info->FlyAudioInfo.preMainMute = pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute;
+					DBG1(RETAILMSG(1, (TEXT("\r\nTda7419 Global Mute:%d"),pTda7419Info->FlyAudioInfo.preMainMute));)
+				}
+				if (pTda7419Info->FlyAudioInfo.preMainVolume != pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume)//全局
+				{
+					pTda7419Info->FlyAudioInfo.preMainVolume = pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume;
+					pTda7419Info->FlyAudioInfo.dspMainVolume = pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume;
+					DBG1(RETAILMSG(1, (TEXT("\r\nTda7419 Global Volume:%d"),pTda7419Info->FlyAudioInfo.preMainVolume));)
+				}
+			}
+			
+			if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_STANDBY_AUDIO_ID))
+			{
+				eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_STANDBY_AUDIO_ID);
+				if (!pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bStandbyStatus)
+				{
+					Sleep(618);
+					for(i = 0; i < 18; i++)
+					{
+						I2C_Write_Tda7419(pTda7419Info, i, &TDA7419_Para[i], 1);
+					}
+				}
+			}
+			
+			if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bStandbyStatus)
+			{
+				pTda7419Info->FlyAudioInfo.preMainMute = TRUE;
+			}
+			else
+			{
+				pTda7419Info->FlyAudioInfo.preMainMute = pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bMute;
+			}
+
+			//倒车降低音量
+			if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_BACK_LOW_VOLUME_ID))
+			{
+				eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_BACK_LOW_VOLUME_ID);
+				volumeFaderInOut(pTda7419Info,TRUE);
+			}
+
+			if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveFlyAudioExtAMP)
+			{
+				pTda7419Info->FlyAudioInfo.preMainVolume = 55;
+			}
+			else if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackDetectEnable
+				&& pTda7419Info->FlyAudioInfo.curMainAudioInput != EXT_TEL
+				&& pTda7419Info->FlyAudioInfo.curMainAudioInput != BT 
+				&& pTda7419Info->FlyAudioInfo.curMainAudioInput != BT_RING)
+			{
+				if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBackActiveNow)
+				{
+					if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume > 20)
+					{
+						pTda7419Info->FlyAudioInfo.preMainVolume = 20;
+					}
+					else
+					{
+						pTda7419Info->FlyAudioInfo.preMainVolume = pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume;
+					}				
+				}
+				else
+				{
+					pTda7419Info->FlyAudioInfo.preMainVolume = pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume;
+				}
+			}
+			else
+			{
+				pTda7419Info->FlyAudioInfo.preMainVolume = pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iVolume;
+			}
+			
+			if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_BTCALLSTATUS_CHANGE_ID))
+			{
+				eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_BTCALLSTATUS_CHANGE_ID);
+			}
+			if (eventInterWhatEventOn(pTda7419Info,EVENT_GLOBAL_PHONECALLSTATUS_CHANGE_ID))
+			{
+				eventInterClrEvent(pTda7419Info,EVENT_GLOBAL_PHONECALLSTATUS_CHANGE_ID);
+			}
+			if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iExtTelCallStatus)//外部电话
+			{
+				pTda7419Info->FlyAudioInfo.tmpMainAudioInput = EXT_TEL;
+			}
+			else if (0x03 == pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iBTCallStatus)//通话中
+			{
+				pTda7419Info->FlyAudioInfo.tmpMainAudioInput = BT;
+			}
+			else if (0x02 == pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iBTCallStatus)//去电中
+			{
+				pTda7419Info->FlyAudioInfo.tmpMainAudioInput = BT;
+			}
+			else if (0x01 == pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iBTCallStatus)//来电中
+			{
+				pTda7419Info->FlyAudioInfo.tmpMainAudioInput = BT_RING;
+			}
+			else//平时正常
+			{
+				pTda7419Info->FlyAudioInfo.tmpMainAudioInput = pTda7419Info->FlyAudioInfo.preMainAudioInput;
+			}
+
+			if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveFlyAudioExtAMP)
+			{
+				pTda7419Info->FlyAudioInfo.tmpBassFreq = 0;
+				pTda7419Info->FlyAudioInfo.tmpBassLevel = BASS_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpMidFreq = 0;
+				pTda7419Info->FlyAudioInfo.tmpMidLevel = MID_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpTrebleFreq = 0;
+				pTda7419Info->FlyAudioInfo.tmpTrebleLevel = TREB_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpLoudnessOn = FALSE;
+				pTda7419Info->FlyAudioInfo.tmpLoudFreq = 0;
+				pTda7419Info->FlyAudioInfo.tmpLoudLevel = LOUDNESS_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpBalance = BALANCE_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpFader = FADER_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpSubOn = FALSE;
+				pTda7419Info->FlyAudioInfo.tmpSubFilter = 0;
+				pTda7419Info->FlyAudioInfo.tmpSubLevel = 0;
+			}
+			else if (pTda7419Info->FlyAudioInfo.tmpMainAudioInput == EXT_TEL
+				|| pTda7419Info->FlyAudioInfo.tmpMainAudioInput == BT 
+				|| pTda7419Info->FlyAudioInfo.tmpMainAudioInput == BT_RING)
+			{
+				pTda7419Info->FlyAudioInfo.tmpBassFreq = 0;
+				pTda7419Info->FlyAudioInfo.tmpBassLevel = BASS_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpMidFreq = 0;
+				pTda7419Info->FlyAudioInfo.tmpMidLevel = MID_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpTrebleFreq = 0;
+				pTda7419Info->FlyAudioInfo.tmpTrebleLevel = TREB_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpLoudnessOn = FALSE;
+				pTda7419Info->FlyAudioInfo.tmpLoudFreq = 0;
+				pTda7419Info->FlyAudioInfo.tmpLoudLevel = LOUDNESS_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpBalance = BALANCE_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpFader = FADER_LEVEL_COUNT/2;
+				pTda7419Info->FlyAudioInfo.tmpSubOn = FALSE;
+				pTda7419Info->FlyAudioInfo.tmpSubFilter = 0;
+				pTda7419Info->FlyAudioInfo.tmpSubLevel = 0;		
+			}
+			else
+			{
+				pTda7419Info->FlyAudioInfo.tmpBassFreq = pTda7419Info->FlyAudioInfo.preBassFreq;
+				pTda7419Info->FlyAudioInfo.tmpBassLevel = pTda7419Info->FlyAudioInfo.preBassLevel;
+				pTda7419Info->FlyAudioInfo.tmpMidFreq = pTda7419Info->FlyAudioInfo.preMidFreq;
+				pTda7419Info->FlyAudioInfo.tmpMidLevel = pTda7419Info->FlyAudioInfo.preMidLevel;
+				pTda7419Info->FlyAudioInfo.tmpTrebleFreq = pTda7419Info->FlyAudioInfo.preTrebleFreq;
+				pTda7419Info->FlyAudioInfo.tmpTrebleLevel = pTda7419Info->FlyAudioInfo.preTrebleLevel;
+				pTda7419Info->FlyAudioInfo.tmpLoudnessOn = pTda7419Info->FlyAudioInfo.preLoudnessOn;
+				pTda7419Info->FlyAudioInfo.tmpLoudFreq = pTda7419Info->FlyAudioInfo.preLoudFreq;
+				pTda7419Info->FlyAudioInfo.tmpLoudLevel = pTda7419Info->FlyAudioInfo.preLoudLevel;
+				pTda7419Info->FlyAudioInfo.tmpBalance = pTda7419Info->FlyAudioInfo.preBalance;
+				pTda7419Info->FlyAudioInfo.tmpFader = pTda7419Info->FlyAudioInfo.preFader;
+				pTda7419Info->FlyAudioInfo.tmpSubOn = pTda7419Info->FlyAudioInfo.preSubOn;
+				pTda7419Info->FlyAudioInfo.tmpSubFilter = pTda7419Info->FlyAudioInfo.preSubFilter;
+				pTda7419Info->FlyAudioInfo.tmpSubLevel = pTda7419Info->FlyAudioInfo.preSubLevel;
+			}
+
+			pTda7419Info->FlyAudioInfo.dspBassFreq = pTda7419Info->FlyAudioInfo.preBassFreq;
+			pTda7419Info->FlyAudioInfo.dspBassLevel = pTda7419Info->FlyAudioInfo.preBassLevel;
+			pTda7419Info->FlyAudioInfo.dspMidFreq = pTda7419Info->FlyAudioInfo.preMidFreq;
+			pTda7419Info->FlyAudioInfo.dspMidLevel = pTda7419Info->FlyAudioInfo.preMidLevel;
+			pTda7419Info->FlyAudioInfo.dspTrebleFreq = pTda7419Info->FlyAudioInfo.preTrebleFreq;
+			pTda7419Info->FlyAudioInfo.dspTrebleLevel = pTda7419Info->FlyAudioInfo.preTrebleLevel;
+			pTda7419Info->FlyAudioInfo.dspLoudnessOn = pTda7419Info->FlyAudioInfo.preLoudnessOn;
+			pTda7419Info->FlyAudioInfo.dspLoudFreq = pTda7419Info->FlyAudioInfo.preLoudFreq;
+			pTda7419Info->FlyAudioInfo.dspLoudLevel = pTda7419Info->FlyAudioInfo.preLoudLevel;
+			pTda7419Info->FlyAudioInfo.dspBalance = pTda7419Info->FlyAudioInfo.preBalance;
+			pTda7419Info->FlyAudioInfo.dspFader = pTda7419Info->FlyAudioInfo.preFader;
+			pTda7419Info->FlyAudioInfo.dspSubOn = pTda7419Info->FlyAudioInfo.preSubOn;
+			pTda7419Info->FlyAudioInfo.dspSubFilter = pTda7419Info->FlyAudioInfo.preSubFilter;
+			pTda7419Info->FlyAudioInfo.dspSubLevel = pTda7419Info->FlyAudioInfo.preSubLevel;
+
+			/*******************************************************/
+			//SetEvent(pTda7419Info->hDispatchExtAmpThreadEvent);//这个任务在延时任务
+			/*******************************************************/
+
+			SetEvent(pTda7419Info->hDispatchTda7419DelayThreadEvent);//启动延时任务，控制切换等时序
+
+			DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Main Thread Running")));)
+
+			if (pTda7419Info->FlyAudioInfo.curSimEQ != pTda7419Info->FlyAudioInfo.preSimEQ)
+			{
+				pTda7419Info->FlyAudioInfo.curSimEQ = pTda7419Info->FlyAudioInfo.preSimEQ;
+				returnAudioMainSimEQ(pTda7419Info,pTda7419Info->FlyAudioInfo.curSimEQ);
+			}
+
+			if(pTda7419Info->FlyAudioInfo.curBassFreq != pTda7419Info->FlyAudioInfo.tmpBassFreq || pTda7419Info->FlyAudioInfo.curBassLevel != pTda7419Info->FlyAudioInfo.tmpBassLevel)
+			{				
+				pTda7419Info->FlyAudioInfo.curBassFreq = pTda7419Info->FlyAudioInfo.tmpBassFreq;
+				pTda7419Info->FlyAudioInfo.curBassLevel = pTda7419Info->FlyAudioInfo.tmpBassLevel;
+				Tda7419_Bass(pTda7419Info,pTda7419Info->FlyAudioInfo.curBassFreq,pTda7419Info->FlyAudioInfo.curBassLevel);
+			}
+			if(pTda7419Info->FlyAudioInfo.curMidFreq != pTda7419Info->FlyAudioInfo.tmpMidFreq || pTda7419Info->FlyAudioInfo.curMidLevel != pTda7419Info->FlyAudioInfo.tmpMidLevel)
+			{
+				pTda7419Info->FlyAudioInfo.curMidFreq = pTda7419Info->FlyAudioInfo.tmpMidFreq;
+				pTda7419Info->FlyAudioInfo.curMidLevel = pTda7419Info->FlyAudioInfo.tmpMidLevel;
+				Tda7419_Mid(pTda7419Info,pTda7419Info->FlyAudioInfo.curMidFreq,pTda7419Info->FlyAudioInfo.curMidLevel);
+			}
+			if(pTda7419Info->FlyAudioInfo.curTrebleFreq != pTda7419Info->FlyAudioInfo.tmpTrebleFreq || pTda7419Info->FlyAudioInfo.curTrebleLevel != pTda7419Info->FlyAudioInfo.tmpTrebleLevel)
+			{
+				pTda7419Info->FlyAudioInfo.curTrebleFreq = pTda7419Info->FlyAudioInfo.tmpTrebleFreq;
+				pTda7419Info->FlyAudioInfo.curTrebleLevel = pTda7419Info->FlyAudioInfo.tmpTrebleLevel;
+				Tda7419_Treble(pTda7419Info,pTda7419Info->FlyAudioInfo.curTrebleFreq,pTda7419Info->FlyAudioInfo.curTrebleLevel);
+			}
+			if (pTda7419Info->FlyAudioInfo.curLoudnessOn != pTda7419Info->FlyAudioInfo.tmpLoudnessOn
+				|| pTda7419Info->FlyAudioInfo.curLoudFreq != pTda7419Info->FlyAudioInfo.tmpLoudFreq 
+				|| pTda7419Info->FlyAudioInfo.curLoudLevel != pTda7419Info->FlyAudioInfo.tmpLoudLevel)
+			{
+				pTda7419Info->FlyAudioInfo.curLoudnessOn = pTda7419Info->FlyAudioInfo.tmpLoudnessOn;
+				pTda7419Info->FlyAudioInfo.curLoudFreq = pTda7419Info->FlyAudioInfo.tmpLoudFreq;
+				pTda7419Info->FlyAudioInfo.curLoudLevel = pTda7419Info->FlyAudioInfo.tmpLoudLevel;
+				if (pTda7419Info->FlyAudioInfo.curLoudnessOn)
+				{
+					TDA7419_Loud(pTda7419Info, pTda7419Info->FlyAudioInfo.curLoudFreq, pTda7419Info->FlyAudioInfo.curLoudLevel);
+				} 
+				else
+				{
+					TDA7419_Loud(pTda7419Info,  0, LOUDNESS_LEVEL_COUNT/2);
+				}
+			}
+			if((pTda7419Info->FlyAudioInfo.curBalance != pTda7419Info->FlyAudioInfo.tmpBalance) || (pTda7419Info->FlyAudioInfo.curFader != pTda7419Info->FlyAudioInfo.tmpFader))
+			{
+				pTda7419Info->FlyAudioInfo.curBalance = pTda7419Info->FlyAudioInfo.tmpBalance;
+				pTda7419Info->FlyAudioInfo.curFader = pTda7419Info->FlyAudioInfo.tmpFader;
+				TDA7419_Balance_Fader(pTda7419Info,pTda7419Info->FlyAudioInfo.curBalance, pTda7419Info->FlyAudioInfo.curFader);
+			}
+			if (pTda7419Info->FlyAudioInfo.curSubOn != pTda7419Info->FlyAudioInfo.tmpSubOn
+				|| pTda7419Info->FlyAudioInfo.curSubFilter != pTda7419Info->FlyAudioInfo.tmpSubFilter
+				|| pTda7419Info->FlyAudioInfo.curSubLevel != pTda7419Info->FlyAudioInfo.tmpSubLevel)
+			{
+				pTda7419Info->FlyAudioInfo.curSubOn = pTda7419Info->FlyAudioInfo.tmpSubOn;
+				pTda7419Info->FlyAudioInfo.curSubFilter = pTda7419Info->FlyAudioInfo.tmpSubFilter;
+				pTda7419Info->FlyAudioInfo.curSubLevel = pTda7419Info->FlyAudioInfo.tmpSubLevel;
+				if (pTda7419Info->FlyAudioInfo.curSubOn)
+				{
+					Tda7419_Sub(pTda7419Info,pTda7419Info->FlyAudioInfo.curSubFilter,pTda7419Info->FlyAudioInfo.curSubLevel);
+				} 
+				else
+				{
+					Tda7419_Sub(pTda7419Info,0,0);
+				}
+			}
+
+			if(pTda7419Info->FlyAudioInfo.curReadReg != pTda7419Info->FlyAudioInfo.preReadReg || pTda7419Info->FlyAudioInfo.ReadRegFlag == TRUE)
+			{
+				pTda7419Info->FlyAudioInfo.ReadRegFlag=FALSE;
+				pTda7419Info->FlyAudioInfo.curReadReg = pTda7419Info->FlyAudioInfo.preReadReg;
+				Tda7419_ReadReg(pTda7419Info,pTda7419Info->FlyAudioInfo.curReadReg);
+			}
+
+			//Tda7419_ReadGraphicalSpectrumAnalyzer(pTda7419Info);
+		}
+		//DBG2(RETAILMSG(1, (TEXT("#Tda7419#")));)
+	}
+	pTda7419Info->bPowerUp = FALSE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable = FALSE;//音频芯片替其它驱动控制静音开关
+
+	while (pTda7419Info->Tda7419DelayThreadHandle)
+	{
+		SetEvent(pTda7419Info->hDispatchTda7419DelayThreadEvent);
+		Sleep(10);
+	}
+	CloseHandle(pTda7419Info->hDispatchTda7419DelayThreadEvent);
+
+	if(pTda7419Info->Tda7419I2CHandle)
+	{
+		I2CClose(pTda7419Info->Tda7419I2CHandle);
+		pTda7419Info->Tda7419I2CHandle = NULL;
+	}
+
+	pTda7419Info->Tda7419MainThreadHandle = NULL;
+
+	DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Main Thread Exit)")));)
+	return 0;
+}
+
+void Fly7419AudioParaInitDefault(P_FLY_TDA7419_INFO pTda7419Info)
+{
+	memset(&pTda7419Info->FlyAudioInfo,0xFF,sizeof(FLY_AUDIO_INFO));
+
+	pTda7419Info->FlyAudioInfo.bMuteRadio = FALSE;
+	pTda7419Info->FlyAudioInfo.bMuteBT = FALSE;
+
+	pTda7419Info->FlyAudioInfo.preMainAudioInput = MediaCD;
+	pTda7419Info->FlyAudioInfo.curMainAudioInput = Init;
+
+	pTda7419Info->FlyAudioInfo.preMainVolume = 15;
+	pTda7419Info->FlyAudioInfo.preMainMute = TRUE;
+	pTda7419Info->FlyAudioInfo.preBassFreq = 0;
+	pTda7419Info->FlyAudioInfo.preBassLevel = BASS_LEVEL_COUNT/2;
+	pTda7419Info->FlyAudioInfo.preMidFreq = 0;
+	pTda7419Info->FlyAudioInfo.preMidLevel = MID_LEVEL_COUNT/2;
+	pTda7419Info->FlyAudioInfo.preTrebleFreq = 0;
+	pTda7419Info->FlyAudioInfo.preTrebleLevel = TREB_LEVEL_COUNT/2;
+	pTda7419Info->FlyAudioInfo.preLoudFreq = 0;
+	pTda7419Info->FlyAudioInfo.preLoudLevel = LOUDNESS_LEVEL_COUNT/2;
+	pTda7419Info->FlyAudioInfo.preBalance = BALANCE_LEVEL_COUNT/2;
+	pTda7419Info->FlyAudioInfo.preFader = FADER_LEVEL_COUNT/2;
+	pTda7419Info->FlyAudioInfo.preLoudnessOn = TRUE;
+	pTda7419Info->FlyAudioInfo.preSubOn = TRUE;
+	pTda7419Info->FlyAudioInfo.preSubFilter = 0;
+	pTda7419Info->FlyAudioInfo.preSubLevel = 5;
+
+	pTda7419Info->FlyAudioInfo.preSimEQ = 0;
+
+	pTda7419Info->FlyAudioInfo.preGPSSpeaker = 0;
+
+	pTda7419Info->FlyAudioInfo.bEnableVolumeFader = FALSE;
+}
+
+static void powerNormalInit(P_FLY_TDA7419_INFO pTda7419Info)
+{
+	pTda7419Info->bPowerUp = FALSE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable = FALSE;//音频芯片替其它驱动控制静音开关
+
+	pTda7419Info->bNeedInit = FALSE;
+
+	pTda7419Info->buffToUserHx = 0;
+	pTda7419Info->buffToUserLx = 0;
+
+	memcpy(TDA7419_Para, TDA7741_Init_Data, 18);
+	IO_Control_Init(pTda7419Info);
+	Fly7419AudioParaInitDefault(pTda7419Info);
+}
+
+static void powerOnFirstInit(P_FLY_TDA7419_INFO pTda7419Info)
+{
+	pTda7419Info->bOpen = FALSE;
+	pTda7419Info->bPowerSpecialUp = FALSE;
+
+	pTda7419Info->bKillDispatchTda7419MainThread = TRUE;
+	pTda7419Info->Tda7419MainThreadHandle = NULL;
+	pTda7419Info->hDispatchTda7419MainThreadEvent = NULL;
+
+	/****************INIT FLYAUDIO AMPLIFIER******************/
+	pTda7419Info->bKillDispatchFlyMsgQueueExtAmpReadThread = TRUE;
+	pTda7419Info->hMsgQueueToExtAmpCreate = NULL;
+	pTda7419Info->hMsgQueueFromExtAmpCreate= NULL;
+	pTda7419Info->FLyMsgQueueExtAmpReadThreadHandle= NULL;
+
+	pTda7419Info->bKillDispatchExtAmpThread = TRUE;
+	pTda7419Info->ExtAmpThreadHandle = NULL;
+	pTda7419Info->hDispatchExtAmpThreadEvent =NULL;
+	/********************************************************/
+
+	pTda7419Info->bKillDispatchTda7419DelayThread = TRUE;
+	pTda7419Info->Tda7419DelayThreadHandle = NULL;
+	pTda7419Info->hDispatchTda7419DelayThreadEvent = NULL;
+
+	pTda7419Info->Tda7419I2CHandle = NULL;
+
+}
+
+static void powerOnSpecialEnable(P_FLY_TDA7419_INFO pTda7419Info,BOOL bOn)
+{
+	DWORD dwThreadID;
+
+	if (bOn)
+	{
+		if (pTda7419Info->bPowerSpecialUp)
+		{
+			return;
+		}
+		pTda7419Info->bPowerSpecialUp = TRUE;
+		
+		pTda7419Info->hBuffToUserDataEvent = CreateEvent(NULL,FALSE,FALSE,NULL);	
+		InitializeCriticalSection(&pTda7419Info->hCSSendToUser);
+
+		/***********************Creat MSGS of  FLYAUDIO EXT AMPLIFIER***********************************/
+		MSGQUEUEOPTIONS  msgOpts;
+
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_TO_EXTAMP_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_TO_EXTAMP_LENGTH;
+		msgOpts.bReadAccess = TRUE;
+		pTda7419Info->hMsgQueueToExtAmpCreate = CreateMsgQueue(FLY_MSG_QUEUE_TO_EXTAMP_NAME, &msgOpts);
+		if (NULL == pTda7419Info->hMsgQueueToExtAmpCreate)
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio TDA7419 Create MsgQueue To ExtAmp Fail!")));)
+		}
+
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_FROM_EXTAMP_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_FROM_EXTAMP_LENGTH;
+		msgOpts.bReadAccess = FALSE;
+		pTda7419Info->hMsgQueueFromExtAmpCreate = CreateMsgQueue(FLY_MSG_QUEUE_FROM_EXTAMP_NAME, &msgOpts);
+		if (NULL == pTda7419Info->hMsgQueueFromExtAmpCreate)
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio ExtAmp Create MsgQueue From ExtAmp Fail!")));)
+		}
+
+		pTda7419Info->bKillDispatchFlyMsgQueueExtAmpReadThread = FALSE;
+		pTda7419Info->FLyMsgQueueExtAmpReadThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadExtAmpRead, //线程的全局函数
+			pTda7419Info, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\n7419 ThreadExtAmpRead thread!%x"),dwThreadID));)
+		if (NULL == pTda7419Info->FLyMsgQueueExtAmpReadThreadHandle)
+		{
+			pTda7419Info->bKillDispatchFlyMsgQueueExtAmpReadThread = TRUE;
+			return;
+		}
+		/********************************************************************************************/
+	} 
+	else
+	{
+		if (!pTda7419Info->bPowerSpecialUp)
+		{
+			return;
+		}
+		pTda7419Info->bPowerSpecialUp = FALSE;
+
+		/*******Close MSGS of Flyaudio amplifier***********************/
+		pTda7419Info->bKillDispatchFlyMsgQueueExtAmpReadThread = TRUE;
+		while (pTda7419Info->FLyMsgQueueExtAmpReadThreadHandle)
+		{
+			SetEvent(pTda7419Info->hMsgQueueToExtAmpCreate);
+			Sleep(10);
+		}
+		CloseMsgQueue(pTda7419Info->hMsgQueueToExtAmpCreate);
+		CloseMsgQueue(pTda7419Info->hMsgQueueFromExtAmpCreate);
+		/****************************************************************/
+
+		CloseHandle(pTda7419Info->hBuffToUserDataEvent);
+	}
+}
+
+VOID Fly7419Enable(P_FLY_TDA7419_INFO pTda7419Info,BOOL bOn)
+{
+	DWORD dwThreadID;
+
+	if(bOn)
+	{
+		//pTda7419Info->Tda7419I2CHandle = I2COpen(TEXT("I2C2:"));
+		pTda7419Info->Tda7419I2CHandle = I2COpen(TEXT("I2C1:"));
+		if(pTda7419Info->Tda7419I2CHandle == NULL)
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nFLY7419:: Error open I2C1!")));)
+			return;
+		}
+
+		pTda7419Info->bKillDispatchTda7419MainThread = FALSE;
+		pTda7419Info->hDispatchTda7419MainThreadEvent = CreateEvent(NULL, FALSE, TRUE, DATA_GLOBAL_HANDLE_AUDIO);
+		pTda7419Info->Tda7419MainThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)Tda7419MainThread, //线程的全局函数
+			pTda7419Info, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		if (NULL == pTda7419Info->Tda7419MainThreadHandle)
+		{
+			pTda7419Info->bKillDispatchTda7419MainThread = TRUE;
+			return;
+		}
+		DBG0(RETAILMSG(1, (TEXT("\r\n7419 Tda7419MainThread thread!%x"),dwThreadID));)
+
+		pTda7419Info->bKillDispatchTda7419DelayThread = FALSE;
+		pTda7419Info->hDispatchTda7419DelayThreadEvent = CreateEvent(NULL, FALSE, TRUE, NULL);
+		pTda7419Info->Tda7419DelayThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)Tda7419DelayThread, //线程的全局函数
+			pTda7419Info, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		if (NULL == pTda7419Info->Tda7419DelayThreadHandle)
+		{
+			pTda7419Info->bKillDispatchTda7419DelayThread = TRUE;
+			return;
+		}
+		DBG0(RETAILMSG(1, (TEXT("\r\n7419 Tda7419DelayThread thread!%x"),dwThreadID));)
+
+		/**************Create and enable Flyaudio Amplifier process ********************************/
+		pTda7419Info->bKillDispatchExtAmpThread = FALSE;
+		pTda7419Info->hDispatchExtAmpThreadEvent = CreateEvent(NULL, FALSE, TRUE, NULL);
+		pTda7419Info->ExtAmpThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ExtAmpProcessThread, //线程的全局函数
+			pTda7419Info, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		if (NULL == pTda7419Info->ExtAmpThreadHandle)
+		{
+			pTda7419Info->bKillDispatchExtAmpThread = TRUE;
+			return;
+		}
+		DBG0(RETAILMSG(1, (TEXT("\r\n7419 ExtAmpProcessThread thread!%x"),dwThreadID));)
+			/*************************************************************************************/
+	}
+	else
+	{
+		pTda7419Info->bKillDispatchTda7419MainThread = TRUE;
+		SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+
+		pTda7419Info->bKillDispatchTda7419DelayThread = TRUE;
+		SetEvent(pTda7419Info->hDispatchTda7419DelayThreadEvent);
+
+		/*************Disable Flyaudio Amplifier process thread*********/
+		pTda7419Info->bKillDispatchExtAmpThread = TRUE;
+		SetEvent(pTda7419Info->hDispatchExtAmpThreadEvent);
+		/***************************************************************/
+
+		while (pTda7419Info->Tda7419MainThreadHandle)
+		{
+			SetEvent(pTda7419Info->hDispatchTda7419MainThreadEvent);
+			Sleep(10);
+		}
+		CloseHandle(pTda7419Info->hDispatchTda7419MainThreadEvent);
+	}
+}
+
+HANDLE FAU_Init(DWORD dwContext)
+{
+	P_FLY_TDA7419_INFO pTda7419Info;
+
+	RETAILMSG(1, (TEXT("\r\n7419 Init Start")));
+
+	// 加载驱动并取得函数指针数组的地址(存放了要引出的底层函数的指针)
+	pUDDApiTable = UDD_ConnectService();
+	if(SOC_Version_Check(SOC_DRV_VERSION) == FALSE)
+	{
+		RETAILMSG(1, (TEXT("FlyAudio Foryou ERR SOC_Version_Check!\r\n")));
+		// 错误处理
+	}
+	pTda7419Info = (P_FLY_TDA7419_INFO)LocalAlloc(LPTR, sizeof(FLY_TDA7419_INFO));
+	if (!pTda7419Info)
+	{
+		return NULL;
+	}
+	//全局
+	pTda7419Info->pFlyDriverGlobalInfo = SOC_DriverGlobal_Get();
+
+	if (pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalStructSize
+		!= sizeof(FLY_DRIVER_GLOBAL))
+	{
+		pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[0] = 'F';
+		pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[1] = 'A';
+		pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[2] = 'U';
+	}
+
+	//参数初始化
+	powerNormalInit(pTda7419Info);
+	powerOnFirstInit(pTda7419Info);
+	powerOnSpecialEnable(pTda7419Info,TRUE);
+
+	control7386Mute(pTda7419Info,TRUE);
+
+#if GLOBAL_COMM
+	pTda7419Info->hHandleGlobalGlobalEvent = CreateEvent(NULL,FALSE,FALSE,DATA_GLOBAL_HANDLE_GLOBAL);
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.bInit = TRUE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.iDriverCompYear = year;
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.iDriverCompMon = months;
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.iDriverCompDay = day;
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.iDriverCompHour = hours;
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.iDriverCompMin = minutes;
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.iDriverCompSec = seconds;
+#endif
+
+	RETAILMSG(1, (TEXT("\r\nTda7419 Init Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));
+	return (HANDLE)pTda7419Info;
+}
+
+BOOL FAU_Deinit(DWORD hDeviceContext)
+{
+	P_FLY_TDA7419_INFO	pTda7419Info = (P_FLY_TDA7419_INFO)hDeviceContext;
+	RETAILMSG(1, (TEXT("\r\nTda7419 DeInit")));
+	CloseHandle(pTda7419Info->hBuffToUserDataEvent);
+	LocalFree(pTda7419Info);
+	return TRUE;
+}
+
+DWORD FAU_Open(DWORD hDeviceContext, DWORD AccessCode, DWORD ShareMode)
+{
+	P_FLY_TDA7419_INFO	pTda7419Info = (P_FLY_TDA7419_INFO)hDeviceContext;
+	DWORD returnWhat = hDeviceContext;
+
+	RETAILMSG(1, (TEXT("\r\nTda7419 Open Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));
+
+	if(pTda7419Info->bOpen)
+	{
+		returnWhat = NULL;
+	}
+	else
+	{
+		pTda7419Info->bOpen = TRUE;
+	}
+
+	Fly7419Enable(pTda7419Info,TRUE);
+
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.bOpen = TRUE;
+
+	return returnWhat;
+}
+
+BOOL FAU_Close(DWORD hDeviceContext)
+{
+	P_FLY_TDA7419_INFO	pTda7419Info = (P_FLY_TDA7419_INFO)hDeviceContext;
+
+
+	pTda7419Info->bOpen = FALSE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.bOpen = FALSE;
+	Fly7419Enable(pTda7419Info,FALSE);
+
+	SetEvent(pTda7419Info->hBuffToUserDataEvent);
+	RETAILMSG(1, (TEXT("\r\nTda7419 Close")));
+	return TRUE;
+}
+
+VOID FAU_PowerUp(DWORD hDeviceContext)
+{
+	P_FLY_TDA7419_INFO pTda7419Info = (P_FLY_TDA7419_INFO)hDeviceContext;
+
+	powerNormalInit(pTda7419Info);
+
+	if (!pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveRecAccOffBefore)//驱动主动开始
+	{
+		pTda7419Info->bPowerUp = TRUE;
+		pTda7419Info->bNeedInit = TRUE;
+	}
+
+	RETAILMSG(1, (TEXT("\r\nTda7419 PowerUp")));
+}
+
+VOID FAU_PowerDown(DWORD hDeviceContext)
+{
+	P_FLY_TDA7419_INFO pTda7419Info = (P_FLY_TDA7419_INFO)hDeviceContext;
+
+	pTda7419Info->bPowerUp = FALSE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bAudioMuteControlable = FALSE;//音频芯片替其它驱动控制静音开关
+
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.iNeedProcVoltageShakeAudio = 0;
+
+	control7386Mute(pTda7419Info,TRUE);
+
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNeedProcBeforeAudioSleep = FALSE;
+	pTda7419Info->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveProcBeforeAudioSleep = FALSE;
+
+	RETAILMSG(1, (TEXT("\r\nTda7419 PowerDown")));
+}
+
+DWORD FAU_Read(DWORD hOpenContext, LPVOID pBuffer, DWORD Count)
+{
+	P_FLY_TDA7419_INFO	pTda7419Info = (P_FLY_TDA7419_INFO)hOpenContext;
+	UINT dwRead = 0;
+	BYTE *SendBuf = (BYTE *)pBuffer;
+
+	while(dwRead < Count && pTda7419Info->buffToUserLx != pTda7419Info->buffToUserHx)
+	{
+		SendBuf[dwRead++] = pTda7419Info->buffToUser[pTda7419Info->buffToUserLx++];
+		if (pTda7419Info->buffToUserLx >= DATA_BUFF_LENGTH_TO_USER)
+		{
+			pTda7419Info->buffToUserLx = 0;
+		}
+	}
+	if(pTda7419Info->buffToUserLx != pTda7419Info->buffToUserHx)
+	{
+		SetEvent(pTda7419Info->hBuffToUserDataEvent);
+	}
+	return dwRead;
+}
+
+DWORD FAU_Write(DWORD hOpenContext, LPCVOID pSourceBytes, DWORD NumberOfBytes)
+{
+	P_FLY_TDA7419_INFO	pTda7419Info = (P_FLY_TDA7419_INFO)hOpenContext;
+	DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 Write %d "),
+		NumberOfBytes));)
+	for(UINT i = 0;i < NumberOfBytes;i++)
+	{
+		DBG2(RETAILMSG(1, (TEXT(" %X"),
+			*((BYTE *)pSourceBytes + i)));)
+	}
+	if(NumberOfBytes)
+	{
+		DealWinceCmd(pTda7419Info,(((BYTE *)pSourceBytes)+3),((BYTE *)pSourceBytes)[2] - 1);
+	}
+	return NULL;
+}
+
+DWORD FAU_Seek(DWORD hOpenContext, LONG Amount, DWORD  Type)
+{
+	return NULL;
+}
+
+BOOL FAU_IOControl(DWORD hOpenContext,
+				   DWORD dwCode, PBYTE pBufIn, DWORD dwLenIn,
+				   PBYTE pBufOut, DWORD dwLenOut, PDWORD pdwActualOut)
+{
+	P_FLY_TDA7419_INFO	pTda7419Info = (P_FLY_TDA7419_INFO)hOpenContext;
+	BOOL bRes = TRUE;
+
+	if (dwCode != IOCTL_SERIAL_WAIT_ON_MASK)
+	{
+		DBG2(RETAILMSG(1, (TEXT("\r\nTda7419 IOControl(h:0x%X, Code:%X, IN:0x%X, %d, OUT:0x%X, %d, ActOut:0x%X)"),
+			hOpenContext, dwCode, pBufIn, dwLenIn, pBufOut, dwLenOut, pdwActualOut));)
+	}
+
+	switch (dwCode)
+	{
+	case IOCTL_SERIAL_SET_WAIT_MASK:
+		DBG3(RETAILMSG(1, (TEXT("\r\nTda7419 IOControl Set IOCTL_SERIAL_SET_WAIT_MASK")));)
+		break;
+	case IOCTL_SERIAL_WAIT_ON_MASK:
+		DBG3(RETAILMSG(1, (TEXT("\r\nTda7419 IOControl Set IOCTL_SERIAL_WAIT_ON_MASK Enter")));)
+		if (pTda7419Info->bOpen)
+		{
+			WaitForSingleObject(pTda7419Info->hBuffToUserDataEvent,INFINITE);
+		} 
+		else
+		{
+			WaitForSingleObject(pTda7419Info->hBuffToUserDataEvent,0);
+		}
+		if ((dwLenOut < sizeof(DWORD)) || (NULL == pBufOut) ||
+			(NULL == pdwActualOut))
+		{
+			bRes = FALSE;
+			break;
+		}
+		*(DWORD *)pBufOut = EV_RXCHAR;
+		*pdwActualOut = sizeof(DWORD);
+		DBG3(RETAILMSG(1, (TEXT("\r\nTda7419 IOControl Set IOCTL_SERIAL_WAIT_ON_MASK Exit")));)
+		break;
+	default :
+		break;
+	}
+
+	return TRUE;
+}
+
+BOOL DllEntry(
+			  HINSTANCE hinstDll,
+			  DWORD dwReason,
+			  LPVOID lpReserved
+			  )
+{
+	if (dwReason == DLL_PROCESS_ATTACH)
+	{
+		DEBUGMSG(1, (TEXT("Attach in Fly7419 DllEntry\n")));
+		DisableThreadLibraryCalls((HMODULE)hinstDll);
+	}
+
+	if (dwReason == DLL_PROCESS_DETACH)
+	{
+		DEBUGMSG(1, (TEXT("Dettach in Fly7419 DllEntry\n")));
+	}
+
+	DEBUGMSG(1, (TEXT("Leaving Fly7419 DllEntry\n")));
+
+	return (TRUE);
+}

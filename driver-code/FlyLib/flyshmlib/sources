@@ -1,0 +1,18 @@
+TARGETNAME=flyshmlib
+FILE_VIEW_ROOT_FOLDER= \
+    Readme.txt \
+
+FILE_VIEW_RESOURCE_FOLDER= \
+
+FILE_VIEW_INCLUDES_FOLDER= \
+
+SOURCES= \
+    flyshmlib.cpp \
+    flydbgmsglib.cpp \
+
+INCLUDES= \
+	$(_TARGETPLATROOT)\SRC\inc\flyinc;\
+
+RELEASETYPE=PLATFORM
+MFC=1
+TARGETTYPE=LIBRARY

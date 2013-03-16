@@ -1,0 +1,35 @@
+TARGETNAME=FLYGLOBAL
+FILE_VIEW_ROOT_FOLDER= \
+    ReadMe.txt \
+    FLYGlobal.def \
+
+FILE_VIEW_RESOURCE_FOLDER= \
+
+FILE_VIEW_INCLUDES_FOLDER= \
+    FLYGlobal.h \
+    FILECLASS.h \
+
+SOURCES= \
+    FLYGlobal.cpp \
+    FlyDebugMsg.cpp \
+    FILECLASS.cpp \
+
+RELEASETYPE=PLATFORM
+TARGETTYPE=DYNLINK
+CDEFINES=$(CDEFINES) -DFLYGLOBAL_EXPORTS
+
+CDEFINES=$(CDEFINES) -DFLYGLOBAL_RELEASE
+
+INCLUDES= \
+    $(INCLUDES);$(_TARGETPLATROOT)\SRC\arm2\inc;\
+	$(_TARGETPLATROOT)\SRC\inc\flyinc;\
+
+TARGETLIBS= \
+    $(_PROJECTROOT)\cesysgen\sdk\lib\$(_CPUINDPATH)\coredll.lib \
+    $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyhwlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flyshmlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flysocketlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flyuserlib.lib \
+	$(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\winsock.lib \
+	$(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\ws2.lib \
+

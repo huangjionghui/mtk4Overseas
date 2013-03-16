@@ -1,0 +1,13 @@
+; Copyright (c) 2010-2011 FlyAudio Corporation.  All rights reserved.
+LIBRARY FlyExBox
+
+EXPORTS FEB_Init
+	FEB_Deinit
+	FEB_Open
+	FEB_Close
+	FEB_Read
+	FEB_Write
+	FEB_Seek
+	FEB_PowerDown
+	FEB_PowerUp
+	FEB_IOControl

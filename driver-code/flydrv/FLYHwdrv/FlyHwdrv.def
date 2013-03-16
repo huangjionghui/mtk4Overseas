@@ -1,0 +1,14 @@
+LIBRARY hwdrv
+
+EXPORTS HWD_Init
+	HWD_Deinit
+	HWD_Open
+	HWD_Close
+	HWD_Read
+	HWD_Write
+	HWD_Seek
+	HWD_PowerDown
+	HWD_PowerUp
+	HWD_IOControl
+	HWD_GetDllProcAddr
+	HWD_CreateShareMmap

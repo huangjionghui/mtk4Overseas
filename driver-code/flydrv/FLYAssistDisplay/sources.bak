@@ -1,0 +1,27 @@
+TARGETNAME=FLYAssistDisplay
+FILE_VIEW_ROOT_FOLDER= \
+    ReadMe.txt \
+    FLYAssistDisplay.def \
+
+FILE_VIEW_RESOURCE_FOLDER= \
+
+FILE_VIEW_INCLUDES_FOLDER= \
+    FLYAssistDisplay.h \
+
+SOURCES= \
+    FLYAssistDisplay.cpp \
+    FLYCarLcdDisplay.cpp\
+
+
+RELEASETYPE=PLATFORM
+TARGETTYPE=DYNLINK
+CDEFINES=$(CDEFINES) -DFLYTEST_EXPORTS
+
+CDEFINES=$(CDEFINES) -DFLYTEST_RELEASE
+
+SOC_TARGETLIBS=$(_COMMONSDKROOT)\lib\$(_CPUINDPATH)\coredll.lib	\
+               $(_TARGETPLATROOT)\lib\$(_CPUINDPATH)\SOC_Service.lib \
+               $(_TARGETPLATROOT)\lib\$(_CPUINDPATH)\SOC_Ioctl.lib \
+
+TARGETLIBS=$(SOC_TARGETLIBS)
+

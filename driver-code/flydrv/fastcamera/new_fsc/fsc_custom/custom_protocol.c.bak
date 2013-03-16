@@ -1,0 +1,179 @@
+
+#include<windows.h>
+
+#include"BCLib.h"
+#include "custom_protocol.h"
+#include "backcar_msg.h"
+
+static UINT16  *g_DateBuffer = NULL;
+
+BOOL  SendAck(UINT32 u4Satus)
+{
+	TransferStatus  TS;
+	TS.u4Status = u4Satus;
+	BCUartWriteBlockData((BYTE *)&TS,sizeof(TransferStatus));
+
+	return TRUE;
+
+}
+
+
+
+
+BOOL OnDistance(UINT32 u4Dis)
+{
+    
+
+	ShowDistance(u4Dis);
+
+    return TRUE;
+
+}
+
+#define BACK_CAR_EVENT_CONTROL 0
+#define BACK_CAR_EVENT_CONTROL_NAME L"BACK_CAR_EVENT_CONTROL_NAME"
+enum
+{
+    BACK_CAR_CTRL_START = 0,
+    BACK_CAR_CTRL_STOP,
+    BACK_CAR_CTRL_DATA,
+};
+DWORD WINAPI BCCustomEntry()
+{
+
+
+	BYTE Sign;
+	TransferBlockData TBD;
+	BOOL bRet = FALSE;
+	DWORD dwDis,dwARM2BackCarStatus;
+#if BACK_CAR_EVENT_CONTROL
+    DWORD dwEventData = 0;
+    HANDLE hBackCarCtrlEvent = CreateEvent(NULL, FALSE, FALSE, BACK_CAR_EVENT_CONTROL_NAME);
+    RETAILMSG(TRUE, (TEXT("[BackCarAPP] BACK_CAR_EVENT_CONTROL\r\n")));
+#endif
+	CeSetThreadPriority( GetCurrentThread(), 245 );
+	RETAILMSG(TRUE, (TEXT("[BackCarAPP] BCCustomEntry\r\n")));
+	g_DateBuffer = (UINT16 *)malloc(50*1024);
+	if(g_DateBuffer == NULL)
+	{
+	
+			RETAILMSG(TRUE, (TEXT("[BackCarAPP] ALLOC MEM FAILED\r\n")));
+			return -1;
+	}
+    dwARM2BackCarStatus = BCWaitInitFin(&dwDis);
+	
+#if BACK_CAR_EVENT_CONTROL
+#else
+	bRet = BCUartInit(4,115200);
+	if(!bRet)
+	{
+	    
+		RETAILMSG(TRUE, (TEXT("[BackCarAPP] Init COM Port FAILED\r\n")));
+		return -1;
+		  
+	}
+#endif
+
+	while(TRUE)
+	{
+
+		if(ARM2_STATUS_BACKING_CAR != dwARM2BackCarStatus)
+		{
+#if BACK_CAR_EVENT_CONTROL
+            RETAILMSG(TRUE, (TEXT("[BackCarAPP] WaitForSingleObject BACK_CAR_EVENT_CONTROL\r\n")));
+            WaitForSingleObject(hBackCarCtrlEvent, INFINITE);
+            dwEventData = GetEventData(hBackCarCtrlEvent);
+            RETAILMSG(TRUE, (TEXT("[BackCarAPP]  hBackCarCtrlEvent:0x%x\r\n"), dwEventData));
+#else
+			while(TRUE)
+			{
+				 Sign = 0;
+				 if(!BCUartReadBlockData(&Sign,1))
+					return -1;
+
+				  if(0xEF == Sign)
+				  {
+						RETAILMSG(TRUE, (TEXT("[BackCarAPP] Back Car Start\r\n")));
+						 break;
+				  }
+			}
+#endif
+		}
+		
+		BCAllocateResource();
+
+		CustomUIInit();
+		if(dwARM2BackCarStatus == ARM2_STATUS_BACKING_CAR)
+		{
+			OnDistance(dwDis);
+		    Arm2BuffMemset();
+		}
+		SendAck(TSF_SUCCESS);
+		while(TRUE)
+		{
+#if BACK_CAR_EVENT_CONTROL
+            WORD wHigh = 0;
+            WORD wLow = 0;
+            WaitForSingleObject(hBackCarCtrlEvent, INFINITE);
+            dwEventData = GetEventData(hBackCarCtrlEvent);
+            wHigh = HIWORD(dwEventData);
+            wLow = LOWORD(dwEventData);
+            RETAILMSG(TRUE, (TEXT("[BackCarAPP]  hBackCarCtrlEvent wHigh[0x%x] wLow[0x%x]\r\n"), wHigh, wLow));
+            switch (wLow)
+            {
+            case BACK_CAR_CTRL_STOP:
+                goto FIN;
+                break;
+            case BACK_CAR_CTRL_DATA:
+                OnDistance(wHigh);
+                break;
+            default:
+                break;
+            }
+#else
+			BCUartReadBlockData((BYTE *)&TBD,8);
+			if(TBD.u4DataType == DT_UNKNOWN)
+			{
+
+
+				RETAILMSG(TRUE, (TEXT("[BackCarAPP] Back Car Finished\r\n")));
+				goto FIN;
+			}
+			BCUartReadBlockData((BYTE *)g_DateBuffer,TBD.u4DataLength);
+
+			switch(TBD.u4DataType)
+			{
+			case DT_UNKNOWN:
+				break;
+			case DT_POINT:
+				break;
+			case DT_ANGLE:
+				break;
+			case DT_DISTANCE:
+				
+				OnDistance(*(UINT32  *)g_DateBuffer);
+				
+				break;
+			case DT_BINARY:
+				break;
+			case DT_BITMAP:
+				
+				break;
+			}
+			
+			
+
+			SendAck(TSF_SUCCESS);
+#endif
+		}
+
+FIN:;
+		dwARM2BackCarStatus = ARM2_STATUS_NO_BACK_CAR;
+		BCReleaseResource();
+	}
+
+#if BACK_CAR_EVENT_CONTROL
+    CloseHandle(hBackCarCtrlEvent);
+#endif
+	return 0;
+}

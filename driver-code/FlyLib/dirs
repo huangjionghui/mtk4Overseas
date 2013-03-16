@@ -1,0 +1,7 @@
+DIRS=\
+	flyshmlib\
+	flysocketlib\
+	flyhwlib\
+	flyuserlib\
+	flyseriallib
+

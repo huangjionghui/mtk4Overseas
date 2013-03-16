@@ -1,0 +1,1361 @@
+// -----------------------------------------------------------------------------
+// File Name    : FLYCarbody.cpp
+// Title        : FLYCarbody Driver
+// Author       : JQilin - Copyright (C) 2011
+// Created      : 2011-02-25  
+// Version      : 0.01
+// Target MCU   : WinCE Driver
+// -----------------------------------------------------------------------------
+// Version History:
+/*
+>>>2011-05-18: V0.02 整理了WinCE待机相关的代码
+>>>2011-02-25: V0.01 first draft
+*/
+
+
+#define GLOBAL_COMM	1
+
+#include <drvlib.h>
+#include <bspregmap.h>
+#include <oemintr.h>
+#include <oemdrvlib.h>
+#include "I2C.h"
+#include "driver_global.h"
+#include "FLYCarBody.h"
+
+#include "SOC_FuncDef.h"
+#include "SOC_Service.h"
+
+#include <macros.h>
+#include <memory.h>
+#include <nkintr.h>
+#include <drvglob.h>
+//#include <drvlib.h>
+#include <oal_sysinfo.h>
+#include <cpm.h>
+//#include <gpio.h>
+#include "utlwrap.h"
+#include "thrdprio.h"
+#define _DEF_ATLAS_DBG_ZONE
+#include <dbgzone.h>
+#include "BspPwrBtn.h"
+#include "Windev.h"
+#include "CspSocPwrBtn.h"
+#include <pmpolicy.h>
+
+typedef DWORD (*PFN_SetSystemPowerState)(LPCWSTR, DWORD, DWORD);
+
+extern void PowerOffSystem(void);
+
+PUDD_API_TABLE	  pUDDApiTable=NULL;
+
+//软件编译日期
+#define DIGIT(s, no) ((s)[no] - '0')
+
+const int hours = (10 * DIGIT(__TIME__, 0) + DIGIT(__TIME__, 1));
+const int minutes = (10 * DIGIT(__TIME__, 3) + DIGIT(__TIME__, 4));
+const int seconds = (10 * DIGIT(__TIME__, 6) + DIGIT(__TIME__, 7));
+/* WARNING: This will fail in year 10000 and beyond, as it assumes
+* that a year has four digits. */
+const int year = ( 1000 * DIGIT(__DATE__, 7)
+				  + 100 * DIGIT(__DATE__, 8)
+				  + 10 * DIGIT(__DATE__, 9)
+				  + DIGIT(__DATE__, 10));
+
+/*
+* Jan - 1
+* Feb - 2
+* Mar - 3
+* Apr - 4
+* May - 5
+* Jun - 6
+* Jul - 7
+* Aug - 8
+* Sep - 9
+* Oct - 10
+* Nov - 11
+* Dec - 12
+*/
+
+/* Use the last letter as primary "key" and middle letter whenever
+* two months end in the same letter. */
+const int months = (__DATE__[2] == 'b' ? 2 :
+					(__DATE__[2] == 'y' ? 5 :
+					(__DATE__[2] == 'l' ? 7 :
+					(__DATE__[2] == 'g' ? 8 :
+					(__DATE__[2] == 'p' ? 9 :
+					(__DATE__[2] == 't' ? 10 :
+					(__DATE__[2] == 'v' ? 11 :
+					(__DATE__[2] == 'c' ? 12 :
+					(__DATE__[2] == 'n' ?
+					(__DATE__[1] == 'a' ? 1 : 6) :
+					/* Implicit "r" */
+					(__DATE__[1] == 'a' ? 3 : 4))))))))));
+const int day = ( 10 * (__DATE__[4] == ' ' ? 0 : DIGIT(__DATE__, 4))
+				 + DIGIT(__DATE__, 5));
+//软件编译日期
+
+static void eventInterSetEvent(P_FLY_CARBODY_INFO pCarBodyInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = TRUE;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = GetTickCount();
+	LeaveCriticalSection(&pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	SetEvent(pCarBodyInfo->hHandleGlobalGlobalEvent);
+}
+
+static void eventInterClrEvent(P_FLY_CARBODY_INFO pCarBodyInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat] = FALSE;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatExchange[eWhat] = FALSE;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStartTime[eWhat] = 0;
+	LeaveCriticalSection(&pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+}
+
+static BOOL eventInterWhatEventOn(P_FLY_CARBODY_INFO pCarBodyInfo,enumGlobalDataChange eWhat)
+{
+	EnterCriticalSection(&pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	if (pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalDataChangeWhatStart[eWhat])
+	{
+		LeaveCriticalSection(&pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+		return TRUE;
+	}
+	LeaveCriticalSection(&pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.hCSGlobalDataChange);
+	return FALSE;
+}
+
+static void systemWriteFile(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE *p,UINT length);
+static BOOL extAmpWriteFile(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE *p,UINT length);
+BOOL actualwriteToMCU(P_FLY_CARBODY_INFO pCarBodyInfo);
+
+void MCU_IIC_Isr_Enable(P_FLY_CARBODY_INFO pCarBodyInfo,BOOL bEnable);
+
+//#define IIC_ISR_PIN_G	0
+//#define IIC_ISR_PIN_I	5
+#define IIC_ISR_PIN_G	3
+#define IIC_ISR_PIN_I	6
+static BOOL IsrPinRead(P_FLY_CARBODY_INFO pCarBodyInfo)
+{
+	return SOC_IO_Input(IIC_ISR_PIN_G,IIC_ISR_PIN_I);
+}
+
+static BYTE I2WriteSeq_MCU[] = {
+SEG_MASK_SEND_START | I2C_SEQ_SEG_DEVADDR_W | SEG_MASK_NEED_ACK,//写从设备地址
+I2C_SEQ_SEG_DATA | SEG_MASK_NEED_ACK | SEG_MASK_SEND_STOP
+};
+
+static BYTE I2CReadSeq_MCU[] = {
+SEG_MASK_SEND_START | I2C_SEQ_SEG_DEVADDR_R | SEG_MASK_NEED_ACK,//发读命令
+I2C_SEQ_SEG_DATA    | SEG_MASK_NEED_NACK | SEG_MASK_SEND_STOP //读数据,要逆序
+};
+
+const GUID DEVICE_IFC_I2C_GUID;
+
+static BOOL I2C_Write_MCU(P_FLY_CARBODY_INFO pCarBodyInfo, HANDLE pI2CHandle, ULONG ulRegAddr, PBYTE pRegValBuf, UINT uiValBufLen)
+{
+	I2CTRANS  Trans;
+	Trans.bRead = FALSE;
+	Trans.dwRegAddr = ulRegAddr;
+	Trans.pValueBuf = pRegValBuf;
+	Trans.uiValueLen = uiValBufLen;
+	Trans.dwClock = MCU_I2C_FREQ;
+	Trans.i2cdevinfo.pReadSeq = (PBYTE)I2CReadSeq_MCU;
+	Trans.i2cdevinfo.uiReadSeqLen = sizeof(I2CReadSeq_MCU);
+	Trans.i2cdevinfo.pWriteSeq = (PBYTE)I2WriteSeq_MCU;
+	Trans.i2cdevinfo.uiWriteSeqLen = sizeof(I2WriteSeq_MCU);
+	Trans.i2cdevinfo.ulDevAddrW = MCU_ADDR_W;
+	Trans.i2cdevinfo.ulDevAddrR = MCU_ADDR_R;
+
+	if (!I2CTransact(pI2CHandle, &Trans))
+	{
+		pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iIICErrorOnMCU;
+		DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio MCU:I2C write failed %X"),ulRegAddr));)
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+static BOOL I2C_Read_MCU(P_FLY_CARBODY_INFO pCarBodyInfo, HANDLE pI2CHandle, ULONG ulRegAddr, PBYTE pRegValBuf, UINT uiValBufLen)
+{
+	I2CTRANS  Trans;
+	Trans.bRead = TRUE;
+	Trans.dwRegAddr = ulRegAddr;
+	Trans.pValueBuf = pRegValBuf;
+	Trans.uiValueLen = uiValBufLen;
+	Trans.dwClock = MCU_I2C_FREQ;
+	Trans.i2cdevinfo.pReadSeq = (PBYTE)I2CReadSeq_MCU;
+	Trans.i2cdevinfo.uiReadSeqLen = sizeof(I2CReadSeq_MCU);
+	Trans.i2cdevinfo.pWriteSeq = (PBYTE)I2WriteSeq_MCU;
+	Trans.i2cdevinfo.uiWriteSeqLen = sizeof(I2WriteSeq_MCU);
+	Trans.i2cdevinfo.ulDevAddrW = MCU_ADDR_W;
+	Trans.i2cdevinfo.ulDevAddrR = MCU_ADDR_R;
+
+	if (!I2CTransact(pI2CHandle, &Trans))
+	{
+		pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iIICErrorOnMCU;
+		DBG0(RETAILMSG(1, (TEXT("\r\nFlyAudio MCU:I2C read failed %X"),ulRegAddr));)
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+UINT returnBuffToCarbodyIdleLength(P_FLY_CARBODY_INFO pCarBodyInfo)
+{
+	UINT iLength;
+	iLength = pCarBodyInfo->buffToMCULx + DATA_BUFF_LENGTH_TO_MCU;
+	iLength = iLength - pCarBodyInfo->buffToMCUHx;
+	iLength = iLength % DATA_BUFF_LENGTH_TO_MCU;
+	if (0 == iLength)
+	{
+		iLength = DATA_BUFF_LENGTH_TO_MCU;
+	}
+	return iLength;
+}
+
+void FlyPutToMCUBuff(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE data)
+{
+	pCarBodyInfo->buffToMCU[pCarBodyInfo->buffToMCUHx++] = data;
+	if (pCarBodyInfo->buffToMCUHx >= DATA_BUFF_LENGTH_TO_MCU)
+	{
+		pCarBodyInfo->buffToMCUHx = 0;
+	}
+	if (pCarBodyInfo->buffToMCUHx == pCarBodyInfo->buffToMCULx)
+	{
+		pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBuffToMCUOverflow = TRUE;
+		DBG0(RETAILMSG(1, (TEXT("\r\n\r\n\r\nCarBody Buff to MCU overflow!!!\r\n\r\n\r\n")));)
+	}
+}
+
+void writeToMCU(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE *p,UINT length)
+{
+	BYTE crc;
+	UINT i;
+	if (0x00 == p[0] && 0x02 == p[1])
+	{
+	}
+	else
+	{
+		DBG3(RETAILMSG(1, (TEXT("\r\nCarBody WriteTo MCU:")));)
+			for (i = 0;i < length;i++)
+			{
+				DBG3(RETAILMSG(1, (TEXT(" %x"),p[i]));)
+			}
+	}
+
+	EnterCriticalSection(&pCarBodyInfo->hCSSendToMCU);
+	//if (0x00 == p[0] && 0x00 == p[1])//开机，PowerUp搞定这个
+	//{
+	//	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNoMoreToSendDataWhenToSleep = FALSE;
+	//}
+	if (pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNoMoreToSendDataWhenToSleep)//关机后不发数据
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarBody bNoMoreToSendDataWhenToSleep")));)
+		return;
+	}
+	if (returnBuffToCarbodyIdleLength(pCarBodyInfo) >= (length + 3))
+	{
+		FlyPutToMCUBuff(pCarBodyInfo,0xFF);
+		FlyPutToMCUBuff(pCarBodyInfo,0x55);
+		FlyPutToMCUBuff(pCarBodyInfo,length+1);
+		crc = length + 1;
+		for(i = 0;i < length;i++)
+		{
+			FlyPutToMCUBuff(pCarBodyInfo,p[i]);
+			crc += p[i];
+		}
+		FlyPutToMCUBuff(pCarBodyInfo,crc);
+	}
+	else
+	{
+		pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bBuffToMCUOverflow = TRUE;
+		DBG0(RETAILMSG(1, (TEXT("\r\n\r\n\r\nCarBody Message to MCU overflow!!!\r\n\r\n\r\n")));)
+	}
+	if (0x00 == p[0])
+	{
+		if (0x01 == p[1])//关机
+		{
+			pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNoMoreToSendDataWhenToSleep = TRUE;
+			//MCU_IIC_Isr_Enable(pCarBodyInfo,FALSE);
+		}
+		else if (0x03 == p[1] && 0x04 == p[2])//Reset
+		{
+			pCarBodyInfo->bHaveRecPowerOffOrReset = TRUE;
+		}
+		else if (0x18 == p[1])//Factory
+		{
+			pCarBodyInfo->bHaveRecPowerOffOrReset = TRUE;
+		}
+		else if (0x99 == p[1])//Ultra Low Power
+		{
+			pCarBodyInfo->bHaveRecPowerOffOrReset = TRUE;
+		}
+	}
+	LeaveCriticalSection(&pCarBodyInfo->hCSSendToMCU);
+	SetEvent(pCarBodyInfo->hThreadHandleFlyCarbodyCommEvent);
+	while (actualwriteToMCU(pCarBodyInfo))
+	{
+	}
+}
+
+BOOL actualwriteToMCU(P_FLY_CARBODY_INFO pCarBodyInfo)//可变字节
+{
+	UINT iLength = 0;
+	BYTE buff[DATA_BUFF_LENGTH_TO_MCU];
+	EnterCriticalSection(&pCarBodyInfo->hCSSendToMCU);
+	while (pCarBodyInfo->buffToMCUHx != pCarBodyInfo->buffToMCULx)
+	{
+		buff[iLength++] = pCarBodyInfo->buffToMCU[pCarBodyInfo->buffToMCULx++];
+		if (pCarBodyInfo->buffToMCULx >= DATA_BUFF_LENGTH_TO_MCU)
+		{
+			pCarBodyInfo->buffToMCULx = 0;
+		}
+	}
+	LeaveCriticalSection(&pCarBodyInfo->hCSSendToMCU);
+	if (iLength)
+	{
+		DBG0(
+			RETAILMSG(1, (TEXT("\r\nIIC Write")));
+			for (UINT i = 0;i < iLength;i++)
+			{
+				RETAILMSG(1, (TEXT(" %x"),buff[i]));
+			}
+		)
+		I2C_Write_MCU(pCarBodyInfo,pCarBodyInfo->hFlyCarbodyIIC,0,buff,iLength);
+	}
+
+	return FALSE;
+}
+
+static void controlToMCUPing(P_FLY_CARBODY_INFO pCarBodyInfo,BOOL bWork)
+{
+	BYTE buff[] = {0x00,0x02,0x00};
+
+	if (bWork)
+	{
+		buff[2] = 0x00;
+	}
+	else
+	{
+		buff[2] = 0x01;
+	}
+
+	writeToMCU(pCarBodyInfo,buff,3);
+}
+
+static void dealReadFromMCUAll(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE *p,UINT length)
+	{
+	UINT i;
+	if (0x00 == p[0] && 0x22 == p[1])
+	//if (0)
+	{
+	} 
+	else
+	{
+		DBG1(
+			RETAILMSG(1, (TEXT("\r\nCarbody Read From MCU ")));
+		for (i = 0;i < length;i++)
+		{
+			RETAILMSG(1, (TEXT(" %x"),p[i]));
+		}
+		)
+	}
+
+	switch (p[0])
+	{
+	case 0x00://System
+		switch (p[1])
+		{
+		case 0x90:
+			if (pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalRadioInfo.bInit)
+			{
+				if (FALSE == WriteMsgQueue(pCarBodyInfo->hMsgQueueToRadioCreate, &p[2], length - 2, 0, 0))
+				{
+					DWORD dwError = GetLastError();
+
+					DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To Radio Error!0x%x"),dwError));)
+				}
+			}
+			else
+			{
+				DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To Radio Not Init")));)
+			}
+			break;
+		case 0x92:
+			if (FALSE == WriteMsgQueue(pCarBodyInfo->hMsgQueueToGlobalCreate,&p[2], length-2, 0, 0))
+			{
+				DWORD dwError = GetLastError();
+
+				DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To Global Error!0x%x"),dwError));)
+			}
+			break;
+		case 0x93:
+			pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iRadioAD = p[2]*256 + p[3];
+			pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bRadioADReturn = TRUE;
+			break;
+		default:
+			systemWriteFile(pCarBodyInfo,&p[1],length-1);
+			if (0x00 == p[1] || 0x01 == p[1])
+			{
+				RETAILMSG(1, (TEXT("\r\nCarbody Read MCU MsgQueue ACC ID %d!!!!!!!!"),p[1]));
+			}
+			break;
+		}
+		break;
+	case 0x01:// amplifier
+		if (!extAmpWriteFile(pCarBodyInfo,&p[1],length-1))
+		{
+			if (0x89 == p[1] && 0xFA == p[2])
+			{
+				pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bHaveFlyAudioExtAMP = TRUE;
+			}
+		}
+		break;	
+	case 0x02:
+		if (pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalKeyInfo.bInit)
+		{
+			if (FALSE == WriteMsgQueue(pCarBodyInfo->hMsgQueueToKeyCreate,&p[2], 1, 0, 0))
+			{
+				DWORD dwError = GetLastError();
+
+				DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To Key Error!0x%x"),dwError));)
+			}
+		}
+		else
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To Key Not Init")));)
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static BOOL readFromMCUProcessor(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE *p,UINT length)
+{
+	UINT i;
+
+	for (i = 0;i < length;i++)
+	{
+		switch (pCarBodyInfo->buffFromMCUProcessorStatus)
+		{
+		case 0:
+			if (0xFF == *p)
+			{
+				pCarBodyInfo->buffFromMCUProcessorStatus = 1;
+			}
+			break;
+		case 1:
+			if (0xFF == *p)
+			{
+				pCarBodyInfo->buffFromMCUProcessorStatus = 1;
+			}
+			else if (0x55 == *p)
+			{
+				pCarBodyInfo->buffFromMCUProcessorStatus = 2;
+			}
+			else
+			{
+				pCarBodyInfo->buffFromMCUProcessorStatus = 0;
+			}
+			break;
+		case 2:
+			pCarBodyInfo->buffFromMCUProcessorStatus = 3;
+			pCarBodyInfo->buffFromMCUFrameLength = 0;
+			pCarBodyInfo->buffFromMCUFrameLengthMax = *p;
+			pCarBodyInfo->buffFromMCUCRC = *p;
+			break;
+		case 3:
+			if (pCarBodyInfo->buffFromMCUFrameLength < (pCarBodyInfo->buffFromMCUFrameLengthMax - 1))
+			{
+				pCarBodyInfo->buffFromMCU[pCarBodyInfo->buffFromMCUFrameLength] = *p;
+				pCarBodyInfo->buffFromMCUCRC += *p;
+				pCarBodyInfo->buffFromMCUFrameLength++;
+			}
+			else
+			{
+				pCarBodyInfo->buffFromMCUProcessorStatus = 0;
+				if (pCarBodyInfo->buffFromMCUCRC == *p)
+				{
+					dealReadFromMCUAll(pCarBodyInfo,pCarBodyInfo->buffFromMCU,pCarBodyInfo->buffFromMCUFrameLengthMax-1);
+				}
+				else
+				{
+					DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Read From MCU CRC Error")));)
+				}
+			}
+			break;
+		default:
+			pCarBodyInfo->buffFromMCUProcessorStatus = 0;
+			break;
+		}
+		p++;
+	}
+
+	if (pCarBodyInfo->buffFromMCUProcessorStatus > 1)
+	{
+		return TRUE;
+	}
+	else
+	{
+		return FALSE;
+	}
+}
+
+BOOL actualReadFromMCU(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE *p,UINT length)
+{
+	I2C_Read_MCU(pCarBodyInfo,pCarBodyInfo->hFlyCarbodyIIC,0,p,length);
+	DBG0(
+		RETAILMSG(1, (TEXT("\r\nIIC Read")));
+		for (UINT i = 0;i < length;i++)
+		{
+			RETAILMSG(1, (TEXT(" %x"),p[i]));
+		}
+	)
+	if (readFromMCUProcessor(pCarBodyInfo,p,length))
+	{
+		DBG3(RETAILMSG(1, (TEXT(" More")));)
+		return TRUE;
+	}
+	else
+	{
+		return FALSE;
+	}
+}
+
+static void systemWriteFile(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE *p,UINT length)
+{
+	UINT i;
+	if (pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.bInit)
+	{
+		if (FALSE == WriteMsgQueue(pCarBodyInfo->hMsgQueueToSystemCreate, p, length, 0, 0))
+		{
+			DWORD dwError = GetLastError();
+			DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To System Error!0x%x"),dwError));)
+		}
+	}
+	else
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To System Not Init")));)
+		for (i = 0;i < length;i++)
+		{
+			DBG0(RETAILMSG(1, (TEXT(" %x"),p[i]));)
+		}
+	}
+}
+/****************************************************************/
+/**	Write data to Flyaudio amplifier moudle					   **/
+/***************************************************************/
+static BOOL extAmpWriteFile(P_FLY_CARBODY_INFO pCarBodyInfo,BYTE *p,UINT length)
+{
+	UINT i;
+	if (pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalAudioInfo.bInit)
+	{
+		if(FALSE == WriteMsgQueue(pCarBodyInfo->hMsgQueueToExtAmpCreate, p, length, 0, 0))
+		{
+			DWORD dwError = GetLastError();
+			DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To ExtAmp Error!0x%x"),dwError));)
+			return FALSE;
+		}
+		return TRUE;
+	}
+	else
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Write MsgQueue To ExtAmp Not Init")));)
+		for (i = 0;i < length;i++)
+		{
+			DBG0(RETAILMSG(1, (TEXT(" %x"),p[i]));)
+		}
+		return FALSE;
+	}
+}
+
+/*******************************************************/
+/**	READ DATA FROM FLYAUDIO EXT AMPLIFIER MODULE     **/
+/******************************************************/
+static DWORD WINAPI ThreadExtAmpRead(LPVOID pContext)
+{
+	P_FLY_CARBODY_INFO pCarBodyInfo = (P_FLY_CARBODY_INFO)pContext;	
+	ULONG WaitReturn;
+	BYTE buff[FLY_MSG_QUEUE_FROM_EXTAMP_LENGTH];
+	DWORD dwRes;
+	DWORD dwMsgFlag;
+	UINT i;
+
+	while (!pCarBodyInfo->bKillDispatchFlyMsgQueueExtAmpReadThread)
+	{
+		WaitReturn = WaitForSingleObject(pCarBodyInfo->hMsgQueueFromExtAmpCreate,INFINITE);
+		if (WAIT_FAILED == WaitReturn)
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadRead Event hMsgQueueFromSystemCreate Error")));)
+		}
+		ReadMsgQueue(pCarBodyInfo->hMsgQueueFromExtAmpCreate, buff, FLY_MSG_QUEUE_FROM_EXTAMP_LENGTH, &dwRes, 0, &dwMsgFlag);
+		if(dwRes)
+		{
+			DBG1(RETAILMSG(1, (TEXT("\r\nCarbody Read ExtAmp MsgQueue length:%d"),dwRes));)
+				for (i = 0;i < dwRes;i++)
+				{
+					DBG1(RETAILMSG(1, (TEXT(" %x"),buff[i]));)
+				}
+
+				writeToMCU(pCarBodyInfo,buff,dwRes);
+		}
+
+	}
+	pCarBodyInfo->FLyMsgQueueExtAmpReadThreadHandle = NULL;
+	DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadExtAmpRead exit")));)
+		return 0;
+}
+
+static DWORD WINAPI ThreadSystemRead(LPVOID pContext)
+{
+	P_FLY_CARBODY_INFO pCarBodyInfo = (P_FLY_CARBODY_INFO)pContext;
+	ULONG WaitReturn;
+	BYTE buff[FLY_MSG_QUEUE_FROM_SYSTEM_LENGTH];
+	DWORD dwRes;
+	DWORD dwMsgFlag;
+	UINT i;
+
+	while (!pCarBodyInfo->bKillDispatchFlyMsgQueueSystemReadThread)
+	{
+		WaitReturn = WaitForSingleObject(pCarBodyInfo->hMsgQueueFromSystemCreate, INFINITE);
+		if (WAIT_FAILED == WaitReturn)
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadRead Event hMsgQueueFromSystemCreate Error")));)
+		}
+		ReadMsgQueue(pCarBodyInfo->hMsgQueueFromSystemCreate, buff, FLY_MSG_QUEUE_FROM_SYSTEM_LENGTH, &dwRes, 0, &dwMsgFlag);
+		if(dwRes)
+		{
+			DBG1(RETAILMSG(1, (TEXT("\r\nCarbody Read System MsgQueue length:%d"),dwRes));)
+			for (i = 0;i < dwRes;i++)
+			{
+				DBG1(RETAILMSG(1, (TEXT(" %x"),buff[i]));)
+			}
+
+			writeToMCU(pCarBodyInfo,buff,dwRes);
+		}
+	}
+	pCarBodyInfo->FLyMsgQueueSystemReadThreadHandle = NULL;
+	DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadSystemRead exit")));)
+	return 0;
+}
+
+static DWORD WINAPI ThreadAssistDisplayRead(LPVOID pContext)
+{
+	P_FLY_CARBODY_INFO pCarBodyInfo = (P_FLY_CARBODY_INFO)pContext;
+	ULONG WaitReturn;
+	BYTE buff[1+FLY_MSG_QUEUE_FROM_ASSISTDISPLAY_LENGTH];
+	DWORD dwRes;
+	DWORD dwMsgFlag;
+
+	buff[0] = 0x03;//按照协议更改
+
+	while (!pCarBodyInfo->bKillDispatchFlyMsgQueueAssistDisplayReadThread)
+	{
+		WaitReturn = WaitForSingleObject(pCarBodyInfo->hMsgQueueFromAssistDisplayCreate, INFINITE);
+		if (WAIT_FAILED == WaitReturn)
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadRead Event hMsgQueueFromAssistDisplayCreate Error")));)
+		}
+		ReadMsgQueue(pCarBodyInfo->hMsgQueueFromAssistDisplayCreate, &buff[1], FLY_MSG_QUEUE_FROM_ASSISTDISPLAY_LENGTH, &dwRes, 0, &dwMsgFlag);
+		if(dwRes)
+		{
+			DBG1(RETAILMSG(1, (TEXT("FlyAudio Carbody Read AssistDisplay MsgQueue%d %d\r\n"),dwRes,buff[1]));)
+			writeToMCU(pCarBodyInfo,buff,dwRes+1);
+		}
+	}
+	DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadAssistDisplayRead exit")));)
+	pCarBodyInfo->FLyMsgQueueAssistDisplayReadThreadHandle = NULL;
+	return 0;
+}
+
+void setWinCEPowerOff(P_FLY_CARBODY_INFO pCarBodyInfo)
+{
+	SetSystemPowerState(NULL, POWER_STATE_SUSPEND, POWER_FORCE);
+	return;
+
+	HMODULE hmCore;
+	PFN_SetSystemPowerState gpfnSetSystemPowerState	= NULL;
+
+	hmCore = (HMODULE) LoadLibrary(_T("coredll.dll"));
+
+	if (hmCore == NULL)
+		return;
+
+	gpfnSetSystemPowerState = (PFN_SetSystemPowerState) GetProcAddress(hmCore, _T("SetSystemPowerState"));
+
+	if (gpfnSetSystemPowerState != NULL)
+	{
+		gpfnSetSystemPowerState(NULL, POWER_STATE_SUSPEND, POWER_FORCE);
+	}
+	else
+	{
+		PowerOffSystem();
+	}
+}
+
+static DWORD WINAPI ThreadCarbodyComm(LPVOID pContext)
+{
+	P_FLY_CARBODY_INFO pCarBodyInfo = (P_FLY_CARBODY_INFO)pContext;
+	ULONG WaitReturn;
+	UINT readCount;
+	BYTE readBuff[DATA_BUFF_LENGTH_FROM_MCU];
+
+	DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadAssistDisplayRead Start")));)
+
+	while (!pCarBodyInfo->bKillDispatchFlyCarbodyCommThread)
+	{
+		WaitReturn = WaitForSingleObject(pCarBodyInfo->hThreadHandleFlyCarbodyCommEvent, 618*5);
+		//RETAILMSG(1, (TEXT("\r\nCarbody ThreadAssistDisplayRead Running")));
+		//if (WAIT_TIMEOUT == WaitReturn)
+		//{
+		//	continue;
+		//}
+		if (!pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNoMoreToSendDataWhenToSleep)
+		{
+			while (WAIT_TIMEOUT == WaitReturn || FALSE == IsrPinRead(pCarBodyInfo))
+			{
+				WaitReturn = 0;
+				DBG1(RETAILMSG(1, (TEXT("\r\nMCU IIC Read")));)
+				readCount = 8;
+				//actualReadFromMCU(pCarBodyInfo,readBuff,readCount);
+				while (actualReadFromMCU(pCarBodyInfo,readBuff,readCount))
+				{
+					readCount += 4;
+					if (readCount > DATA_BUFF_LENGTH_FROM_MCU)
+					{
+						readCount = DATA_BUFF_LENGTH_FROM_MCU;
+						DBG0(RETAILMSG(1, (TEXT("\r\nThreadCarbodyComm Sleep100")));)
+						Sleep(100);//延时100ms
+					}
+				}
+			}
+		}
+		while (actualwriteToMCU(pCarBodyInfo))
+		{
+		}
+
+		if (pCarBodyInfo->bHaveRecPowerOffOrReset)
+		{
+			pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNoMoreToSendDataWhenToSleep = TRUE;
+			Sleep(100);
+			setWinCEPowerOff(pCarBodyInfo);
+		}
+	}
+	pCarBodyInfo->hThreadHandleFlyCarbodyComm = NULL;
+	DBG0(RETAILMSG(1, (TEXT("\r\nCarBody ThreadCarbodyComm Exit")));)
+	return 0;
+}
+
+static DWORD WINAPI ThreadMain(LPVOID pContext)
+{
+	P_FLY_CARBODY_INFO pCarBodyInfo = (P_FLY_CARBODY_INFO)pContext;
+	ULONG WaitReturn;
+
+	ULONG timeInter = 0;
+
+
+	while (!pCarBodyInfo->bKillDispatchFlyMainThread)
+	{
+		WaitReturn = WaitForSingleObject(pCarBodyInfo->hDispatchMainThreadEvent, 618);
+		if (WAIT_FAILED == WaitReturn)
+		{
+			DBG0(RETAILMSG(1, (TEXT("\r\nCarBody hDispatchMainThreadEvent Error")));)
+		}
+
+		if (!pCarBodyInfo->xxxxxxxxStarting)
+		{
+			if (pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalSystemInfo.bInit)
+			{
+				pCarBodyInfo->xxxxxxxxStarting = TRUE;
+				controlToMCUPing(pCarBodyInfo,FALSE);
+				eventInterSetEvent(pCarBodyInfo,EVENT_GLOBAL_POWERON_MCU_INIT_ID);
+			}
+		}
+		else if (GetTickCount() - timeInter > 1000)
+		{
+			timeInter = GetTickCount();
+			controlToMCUPing(pCarBodyInfo,TRUE);
+		}
+	}
+
+	while (pCarBodyInfo->hThreadHandleFlyCarbodyComm)
+	{
+		DBG0(RETAILMSG(1, (TEXT("\r\nWait hThreadHandleFlyCarbodyComm")));)
+		SetEvent(pCarBodyInfo->hThreadHandleFlyCarbodyCommEvent);
+		Sleep(10);
+	}
+	CloseHandle(pCarBodyInfo->hThreadHandleFlyCarbodyCommEvent);
+
+	CloseHandle(pCarBodyInfo->hDispatchMainThreadEvent);
+	DBG0(RETAILMSG(1, (TEXT("\r\nCarBody ThreadMain exit")));)
+	pCarBodyInfo->FlyMainThreadHandle = NULL;
+	return 0;
+}
+
+DWORD WINAPI IsrPin_io_isr(LPVOID lpvParam)
+{
+	P_FLY_CARBODY_INFO pCarBodyInfo = (P_FLY_CARBODY_INFO)lpvParam;
+
+	DBG0(RETAILMSG(1, (TEXT("\r\nIsrPin_io_isr Start")));)
+	pCarBodyInfo->bInterruptIsrPinProcRunning = TRUE;
+
+	while (pCarBodyInfo->hInterruptEventIsrPin)
+	{
+		WaitForSingleObject(pCarBodyInfo->hInterruptEventIsrPin, INFINITE);
+
+		if (pCarBodyInfo->hInterruptEventIsrPin)
+		{
+			DBG1(RETAILMSG(1, (TEXT("\r\nIsrPin_io_isr Running")));)
+			SetEvent(pCarBodyInfo->hThreadHandleFlyCarbodyCommEvent);
+	
+			SOC_IO_ISR_ReEn(pCarBodyInfo->hInterruptEventIsrPin);
+		}
+	}
+
+	pCarBodyInfo->bInterruptIsrPinProcRunning = FALSE;
+	DBG0(RETAILMSG(1, (TEXT("\r\nIsrPin_io_isr Finish")));)
+	return NULL;
+}
+
+void MCU_IIC_Isr_Enable(P_FLY_CARBODY_INFO pCarBodyInfo,BOOL bEnable)
+{
+	if (bEnable)
+	{
+		//中断开启
+		pCarBodyInfo->hInterruptEventIsrPin = NULL;
+		SOC_IO_ISR_Add(IIC_ISR_PIN_G,IIC_ISR_PIN_I,GPIO_INTTYPE_FALLING_EDGE,IsrPin_io_isr,pCarBodyInfo,&pCarBodyInfo->hInterruptEventIsrPin);
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Create IsrPin_io_isr")));)
+	}
+	else
+	{
+		//中断关闭
+		if (pCarBodyInfo->hInterruptEventIsrPin)
+		{
+			SOC_IO_ISR_Del(&(pCarBodyInfo->hInterruptEventIsrPin));
+			pCarBodyInfo->hInterruptEventIsrPin = NULL;
+		}
+	}
+}
+
+void CarBodyEnable(P_FLY_CARBODY_INFO pCarBodyInfo,BOOL bEnable)
+{
+	DWORD dwThreadID;
+
+	if (bEnable)
+	{
+		if (pCarBodyInfo->bCarbodyEnable)
+		{
+			return;
+		}
+		pCarBodyInfo->bCarbodyEnable = TRUE;
+
+		pCarBodyInfo->hFlyCarbodyIIC = I2COpen(TEXT("I2C2:"));
+		if(pCarBodyInfo->hFlyCarbodyIIC == NULL)
+		{
+			DBG0(RETAILMSG(1, (TEXT("FlyAudio Carbody Open I2C error!\r\n")));)
+			return;
+		}
+
+		pCarBodyInfo->bKillDispatchFlyMainThread = FALSE;
+		pCarBodyInfo->hDispatchMainThreadEvent = CreateEvent(NULL, FALSE, TRUE, NULL);	
+		pCarBodyInfo->FlyMainThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadMain, //线程的全局函数
+			pCarBodyInfo, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Create ThreadMain ID:0x%x"),dwThreadID));)
+		if (NULL == pCarBodyInfo->FlyMainThreadHandle)
+		{
+			pCarBodyInfo->bKillDispatchFlyMainThread = TRUE;
+			return;
+		}
+
+		pCarBodyInfo->bKillDispatchFlyCarbodyCommThread = FALSE;
+		pCarBodyInfo->hThreadHandleFlyCarbodyCommEvent = CreateEvent(NULL, FALSE, TRUE, NULL);
+		pCarBodyInfo->hThreadHandleFlyCarbodyComm = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadCarbodyComm, //线程的全局函数
+			pCarBodyInfo, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarbody Create ThreadCarbodyComm ID:0x%x"),dwThreadID));)
+		if (NULL == pCarBodyInfo->hThreadHandleFlyCarbodyComm)
+		{
+			pCarBodyInfo->bKillDispatchFlyCarbodyCommThread = TRUE;
+			return;
+		}
+
+		MCU_IIC_Isr_Enable(pCarBodyInfo,TRUE);
+	}
+	else
+	{
+		if (!pCarBodyInfo->bCarbodyEnable)
+		{
+			return;
+		}
+		pCarBodyInfo->bCarbodyEnable = FALSE;
+
+		pCarBodyInfo->bKillDispatchFlyCarbodyCommThread = TRUE;
+		SetEvent(pCarBodyInfo->hThreadHandleFlyCarbodyCommEvent);
+		pCarBodyInfo->bKillDispatchFlyMainThread = TRUE;
+		SetEvent(pCarBodyInfo->hDispatchMainThreadEvent);
+
+		MCU_IIC_Isr_Enable(pCarBodyInfo,FALSE);
+
+		I2CClose(pCarBodyInfo->hFlyCarbodyIIC);
+		pCarBodyInfo->hFlyCarbodyIIC = NULL;
+
+		while (pCarBodyInfo->bInterruptIsrPinProcRunning)
+		{
+			Sleep(10);
+		}
+
+		while (pCarBodyInfo->FlyMainThreadHandle)
+		{
+			Sleep(10);
+		}
+	}
+}
+
+static DWORD WINAPI ThreadPowerUp(LPVOID pContext)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)pContext;
+
+	//Sleep(314);
+	MCU_IIC_Isr_Enable(pCarBodyInfo,TRUE);
+	RETAILMSG(1, (TEXT("\r\nCarBody ThreadPowerUp")));
+
+	return 0;
+}
+
+static void powerOnNormalInit(P_FLY_CARBODY_INFO pCarBodyInfo)
+{
+	pCarBodyInfo->buffToMCUHx = 0;
+	pCarBodyInfo->buffToMCULx = 0;
+
+	pCarBodyInfo->buffFromMCUProcessorStatus = 0;
+	pCarBodyInfo->buffFromMCUFrameLength = 0;
+	pCarBodyInfo->buffFromMCUFrameLengthMax = 0;
+	pCarBodyInfo->buffFromMCUCRC = 0;
+
+	pCarBodyInfo->xxxxxxxxStarting = FALSE;
+
+	pCarBodyInfo->bHaveRecPowerOffOrReset = FALSE;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNoMoreToSendDataWhenToSleep = FALSE;
+}
+
+static void powerOnFirstInit(P_FLY_CARBODY_INFO pCarBodyInfo)
+{
+	pCarBodyInfo->bCarbodyEnable = FALSE;
+
+	pCarBodyInfo->bKillDispatchFlyMainThread = TRUE;
+	pCarBodyInfo->FlyMainThreadHandle = NULL;
+	pCarBodyInfo->hDispatchMainThreadEvent = NULL;
+
+	pCarBodyInfo->hFlyCarbodyIIC = NULL;
+	pCarBodyInfo->bKillDispatchFlyCarbodyCommThread = TRUE;
+	pCarBodyInfo->hThreadHandleFlyCarbodyComm = NULL;
+
+	pCarBodyInfo->hMsgQueueToRadioCreate = NULL;
+
+	pCarBodyInfo->hMsgQueueToSystemCreate = NULL;
+	pCarBodyInfo->hMsgQueueFromSystemCreate = NULL;
+	pCarBodyInfo->bKillDispatchFlyMsgQueueSystemReadThread = TRUE;
+	pCarBodyInfo->FLyMsgQueueSystemReadThreadHandle = NULL;
+
+	/****************INIT FLYAUDIO AMPLIFIER******************/
+	pCarBodyInfo->hMsgQueueToExtAmpCreate = NULL;
+	pCarBodyInfo->hMsgQueueFromExtAmpCreate = NULL;
+	pCarBodyInfo->bKillDispatchFlyMsgQueueExtAmpReadThread = TRUE;
+	pCarBodyInfo->FLyMsgQueueExtAmpReadThreadHandle = NULL;
+	/********************************************************/
+
+	pCarBodyInfo->hMsgQueueFromAssistDisplayCreate = NULL;
+	pCarBodyInfo->bKillDispatchFlyMsgQueueAssistDisplayReadThread = TRUE;
+	pCarBodyInfo->FLyMsgQueueAssistDisplayReadThreadHandle = NULL;
+
+	pCarBodyInfo->hFlyCarbodyIIC = NULL;
+
+	pCarBodyInfo->bKillDispatchFlyCarbodyCommThread = TRUE;
+	pCarBodyInfo->hThreadHandleFlyCarbodyComm = NULL;
+	pCarBodyInfo->hThreadHandleFlyCarbodyCommEvent = NULL;
+
+	pCarBodyInfo->hInterruptEventIsrPin = NULL;
+	pCarBodyInfo->bInterruptIsrPinProcRunning = FALSE;
+
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.bNoMoreToSendDataWhenToSleep = FALSE;
+}
+
+static void powerOnSpecialEnable(P_FLY_CARBODY_INFO pCarBodyInfo,BOOL bOn)
+{
+	DWORD dwThreadID;
+
+	if (bOn)
+	{
+		MSGQUEUEOPTIONS  msgOpts;
+
+		//Global
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_TO_GLOBAL_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_TO_GLOBAL_LENGTH;
+		msgOpts.bReadAccess = FALSE;
+		pCarBodyInfo->hMsgQueueToGlobalCreate = CreateMsgQueue(FLY_MSG_QUEUE_TO_GLOBAL_NAME, &msgOpts);
+		if (NULL == pCarBodyInfo->hMsgQueueToGlobalCreate)
+		{
+			RETAILMSG(1, (TEXT("\r\nCarbody Create MsgQueue To Global Fail!")));
+		}
+
+		//Key
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_TO_KEY_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_TO_KEY_LENGTH;
+		msgOpts.bReadAccess = FALSE;
+		pCarBodyInfo->hMsgQueueToKeyCreate = CreateMsgQueue(FLY_MSG_QUEUE_TO_KEY_NAME, &msgOpts);
+		if (NULL == pCarBodyInfo->hMsgQueueToKeyCreate)
+		{
+			RETAILMSG(1, (TEXT("\r\nCarbody Create MsgQueue To Key Fail!")));
+		}
+
+		//Radio
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_TO_RADIO_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_TO_RADIO_LENGTH;
+		msgOpts.bReadAccess = FALSE;
+		pCarBodyInfo->hMsgQueueToRadioCreate = CreateMsgQueue(FLY_MSG_QUEUE_TO_RADIO_NAME, &msgOpts);
+		if (NULL == pCarBodyInfo->hMsgQueueToRadioCreate)
+		{
+			RETAILMSG(1, (TEXT("\r\nCarbody Create MsgQueue To Radio Fail!")));
+		}
+
+		//System
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_TO_SYSTEM_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_TO_SYSTEM_LENGTH;
+		msgOpts.bReadAccess = FALSE;
+		pCarBodyInfo->hMsgQueueToSystemCreate = CreateMsgQueue(FLY_MSG_QUEUE_TO_SYSTEM_NAME, &msgOpts);
+		if (NULL == pCarBodyInfo->hMsgQueueToSystemCreate)
+		{
+			RETAILMSG(1, (TEXT("\r\nCarbody Create MsgQueue To System Fail!")));
+		}
+
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_FROM_SYSTEM_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_FROM_SYSTEM_LENGTH;
+		msgOpts.bReadAccess = TRUE;
+		pCarBodyInfo->hMsgQueueFromSystemCreate = CreateMsgQueue(FLY_MSG_QUEUE_FROM_SYSTEM_NAME, &msgOpts);
+		if (NULL == pCarBodyInfo->hMsgQueueFromSystemCreate)
+		{
+			RETAILMSG(1, (TEXT("\r\nCarbody Create MsgQueue From System Fail!")));
+		}
+
+		pCarBodyInfo->bKillDispatchFlyMsgQueueSystemReadThread = FALSE;
+		pCarBodyInfo->FLyMsgQueueSystemReadThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadSystemRead, //线程的全局函数
+			pCarBodyInfo, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadSystemRead ID:0x%x"),dwThreadID));)
+		if (NULL == pCarBodyInfo->FLyMsgQueueSystemReadThreadHandle)
+		{
+			pCarBodyInfo->bKillDispatchFlyMsgQueueSystemReadThread = TRUE;
+			return;
+		}
+		/************CREATE AND ENABLE FLYAUDIO EXT AMPLIFIER**********/
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_TO_EXTAMP_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_TO_EXTAMP_LENGTH;
+		msgOpts.bReadAccess = FALSE;
+		pCarBodyInfo->hMsgQueueToExtAmpCreate = CreateMsgQueue(FLY_MSG_QUEUE_TO_EXTAMP_NAME, &msgOpts);
+		if (NULL == pCarBodyInfo->hMsgQueueToExtAmpCreate)
+		{
+			RETAILMSG(1, (TEXT("\r\nCarbody Create MsgQueue To EXTAMP Fail!")));
+		}
+
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_FROM_EXTAMP_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_FROM_EXTAMP_LENGTH;
+		msgOpts.bReadAccess = TRUE;
+		pCarBodyInfo->hMsgQueueFromExtAmpCreate = CreateMsgQueue(FLY_MSG_QUEUE_FROM_EXTAMP_NAME, &msgOpts);
+		if (NULL == pCarBodyInfo->hMsgQueueFromExtAmpCreate)
+		{
+			RETAILMSG(1, (TEXT("\r\nCarbody Create MsgQueue From EXTAMP Fail!")));
+		}
+
+		pCarBodyInfo->bKillDispatchFlyMsgQueueExtAmpReadThread = FALSE;
+		pCarBodyInfo->FLyMsgQueueExtAmpReadThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadExtAmpRead, //线程的全局函数
+			pCarBodyInfo, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadExtAmpRead ID:0x%x"),dwThreadID));)
+		if (NULL == pCarBodyInfo->FLyMsgQueueExtAmpReadThreadHandle)
+		{
+			pCarBodyInfo->bKillDispatchFlyMsgQueueExtAmpReadThread = TRUE;
+			return;
+		}
+		/***************************************************************/
+		//AssistDisplay
+		msgOpts.dwSize = sizeof(MSGQUEUEOPTIONS);
+		msgOpts.dwFlags = FLY_MSG_QUEUE_FLAG;
+		msgOpts.dwMaxMessages = FLY_MSG_QUEUE_FROM_ASSISTDISPLAY_ENTRIES;
+		msgOpts.cbMaxMessage = FLY_MSG_QUEUE_FROM_ASSISTDISPLAY_LENGTH;
+		msgOpts.bReadAccess = TRUE;
+		pCarBodyInfo->hMsgQueueFromAssistDisplayCreate = CreateMsgQueue(FLY_MSG_QUEUE_FROM_ASSISTDISPLAY_NAME, &msgOpts);
+		if (NULL == pCarBodyInfo->hMsgQueueFromAssistDisplayCreate)
+		{
+			RETAILMSG(1, (TEXT("\r\nCarbody Create MsgQueue From AssistDisplay Fail!")));
+		}
+
+		pCarBodyInfo->bKillDispatchFlyMsgQueueAssistDisplayReadThread = FALSE;
+		pCarBodyInfo->FLyMsgQueueAssistDisplayReadThreadHandle = 
+			CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+			0,//初始化线程栈的大小，缺省为与主线程大小相同
+			(LPTHREAD_START_ROUTINE)ThreadAssistDisplayRead, //线程的全局函数
+			pCarBodyInfo, //此处传入了主框架的句柄
+			0, &dwThreadID );
+		DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadAssistDisplayRead ID:0x%x"),dwThreadID));)
+		if (NULL == pCarBodyInfo->FLyMsgQueueAssistDisplayReadThreadHandle)
+		{
+			pCarBodyInfo->bKillDispatchFlyMsgQueueAssistDisplayReadThread = TRUE;
+			return;
+		}
+	} 
+	else
+	{
+		pCarBodyInfo->bKillDispatchFlyMsgQueueSystemReadThread = TRUE;
+		while (pCarBodyInfo->FLyMsgQueueSystemReadThreadHandle)
+		{
+			SetEvent(pCarBodyInfo->hMsgQueueFromSystemCreate);
+			Sleep(10);
+		}
+		CloseMsgQueue(pCarBodyInfo->hMsgQueueToSystemCreate);
+		CloseMsgQueue(pCarBodyInfo->hMsgQueueFromSystemCreate);
+
+		/********CLOSE AND DISABLE MSG FLYAUDIO EXT AMPLIFIER***/
+		pCarBodyInfo->bKillDispatchFlyMsgQueueExtAmpReadThread = TRUE;
+		while (pCarBodyInfo->FLyMsgQueueExtAmpReadThreadHandle)
+		{
+			SetEvent(pCarBodyInfo->hMsgQueueFromExtAmpCreate);
+			Sleep(10);
+		}
+		CloseMsgQueue(pCarBodyInfo->hMsgQueueToExtAmpCreate);
+		CloseMsgQueue(pCarBodyInfo->hMsgQueueFromExtAmpCreate);
+		/********************************************************/
+
+		pCarBodyInfo->bKillDispatchFlyMsgQueueAssistDisplayReadThread = TRUE;
+		while (pCarBodyInfo->FLyMsgQueueAssistDisplayReadThreadHandle)
+		{
+			SetEvent(pCarBodyInfo->hMsgQueueFromAssistDisplayCreate);
+			Sleep(10);
+		}
+		CloseMsgQueue(pCarBodyInfo->hMsgQueueFromAssistDisplayCreate);
+
+		CloseMsgQueue(pCarBodyInfo->hMsgQueueToRadioCreate);
+		CloseMsgQueue(pCarBodyInfo->hMsgQueueToKeyCreate);
+	}
+		
+}
+
+HANDLE
+FCB_Init(DWORD dwContext)
+{
+	P_FLY_CARBODY_INFO pCarBodyInfo;
+
+	RETAILMSG(1, (TEXT("\r\nCarbody Init Start")));
+
+	pUDDApiTable = UDD_ConnectService();
+	if(SOC_Version_Check(SOC_DRV_VERSION) == FALSE)
+	{
+		RETAILMSG(1, (TEXT("FlyAudio Global ERR SOC_Version_Check!\r\n")));
+		// 错误处理
+	}
+
+	pCarBodyInfo = (P_FLY_CARBODY_INFO)LocalAlloc(LPTR, sizeof(FLY_CARBODY_INFO));
+	if (!pCarBodyInfo)
+	{
+		return NULL;
+	}
+	//全局
+	pCarBodyInfo->pFlyDriverGlobalInfo = SOC_DriverGlobal_Get();
+
+	if (pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.iGlobalStructSize
+		!= sizeof(FLY_DRIVER_GLOBAL))
+	{
+		pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[0] = 'F';
+		pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[1] = 'C';
+		pCarBodyInfo->pFlyDriverGlobalInfo->FlySystemRunningInfo.sErrorDriverName[2] = 'B';
+	}
+
+	//参数初始化
+	powerOnNormalInit(pCarBodyInfo);
+	powerOnFirstInit(pCarBodyInfo);
+	powerOnSpecialEnable(pCarBodyInfo,TRUE);
+
+	CarBodyEnable(pCarBodyInfo,TRUE);
+
+	pCarBodyInfo->hHandleGlobalGlobalEvent = CreateEvent(NULL,FALSE,FALSE,DATA_GLOBAL_HANDLE_GLOBAL);
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.bInit = TRUE;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.bOpen = TRUE;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.iDriverCompYear = year;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.iDriverCompMon = months;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.iDriverCompDay = day;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.iDriverCompHour = hours;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.iDriverCompMin = minutes;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.iDriverCompSec = seconds;
+
+	RETAILMSG(1, (TEXT("\r\nCarbody Init Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));
+	return (HANDLE)pCarBodyInfo;
+}
+
+BOOL
+FCB_Deinit(DWORD hDeviceContext)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)hDeviceContext;
+
+#if GLOBAL_COMM
+	//全局
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.bOpen = FALSE;
+	pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.bInit = FALSE;
+	SetEvent(pCarBodyInfo->hHandleGlobalGlobalEvent);
+	CloseHandle(pCarBodyInfo->hHandleGlobalGlobalEvent);
+#endif
+
+	CarBodyEnable(pCarBodyInfo,FALSE);
+	powerOnSpecialEnable(pCarBodyInfo,FALSE);
+
+	LocalFree(pCarBodyInfo);
+
+	RETAILMSG(1, (TEXT("FlyAudio CarBody DeInit\r\n")));
+	return TRUE;
+}
+
+DWORD
+FCB_Open(DWORD hDeviceContext, DWORD AccessCode, DWORD ShareMode)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)hDeviceContext;
+	DWORD returnWhat = hDeviceContext;
+
+	RETAILMSG(1, (TEXT("\r\nCarbody Open Build:Date%d.%d.%dTime%d:%d:%d"),year,months,day,hours,minutes,seconds));
+	return returnWhat;
+}
+
+BOOL
+FCB_Close(DWORD hDeviceContext)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)hDeviceContext;
+
+	RETAILMSG(1, (TEXT("FlyAudio CarBody Close\r\n")));
+	return TRUE;
+}
+
+VOID
+FCB_PowerUp(DWORD hDeviceContext)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)hDeviceContext;
+	DWORD dwThreadID;
+
+	powerOnNormalInit(pCarBodyInfo);
+
+	CreateThread( (LPSECURITY_ATTRIBUTES) NULL, //安全属性
+		0,//初始化线程栈的大小，缺省为与主线程大小相同
+		(LPTHREAD_START_ROUTINE)ThreadPowerUp, //线程的全局函数
+		pCarBodyInfo, //此处传入了主框架的句柄
+		0, &dwThreadID );
+	DBG0(RETAILMSG(1, (TEXT("\r\nCarbody ThreadPowerUp ID:0x%x"),dwThreadID));)
+
+	RETAILMSG(1, (TEXT("FlyAudio CarBody PowerUp\r\n")));
+}
+
+VOID
+FCB_PowerDown(DWORD hDeviceContext)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)hDeviceContext;
+
+	MCU_IIC_Isr_Enable(pCarBodyInfo,FALSE);
+
+	RETAILMSG(1, (TEXT("FlyAudio CarBody PowerDown\r\n")));
+}
+
+DWORD
+FCB_Read(DWORD hOpenContext, LPVOID pBuffer, DWORD Count)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)hOpenContext;
+
+	UINT dwRead = 0;
+
+	return dwRead;
+}
+
+DWORD
+FCB_Write(DWORD hOpenContext, LPCVOID pSourceBytes, DWORD NumberOfBytes)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)hOpenContext;
+	DBG1(RETAILMSG(1, (TEXT("FlyAudio CarBody Write %d \r\n"),
+					NumberOfBytes));)
+
+	return NULL;
+}
+
+DWORD
+FCB_Seek(DWORD hOpenContext, LONG Amount, DWORD  Type)
+{
+	return NULL;
+}
+
+BOOL
+FCB_IOControl(DWORD hOpenContext,
+			  DWORD dwCode, PBYTE pBufIn, DWORD dwLenIn,
+			  PBYTE pBufOut, DWORD dwLenOut, PDWORD pdwActualOut)
+{
+	P_FLY_CARBODY_INFO	pCarBodyInfo = (P_FLY_CARBODY_INFO)hOpenContext;
+	BOOL bRes = TRUE;
+
+	RETAILMSG(1, (TEXT("FlyAudio CarBody IOControl(h:0x%X, Code:%X, IN:0x%X, %d, OUT:0x%X, %d, ActOut:0x%X)\r\n"),
+					hOpenContext, dwCode, pBufIn, dwLenIn, pBufOut, dwLenOut, pdwActualOut));
+
+	//switch (dwCode)
+	//{
+	//default :
+	//	bRes = FALSE;
+	//	break;
+	//}
+
+	return TRUE;
+}
+
+BOOL
+DllEntry(
+		 HINSTANCE hinstDll,
+		 DWORD dwReason,
+		 LPVOID lpReserved
+		 )
+{
+	if (dwReason == DLL_PROCESS_ATTACH)
+	{
+		DEBUGMSG(1, (TEXT("Attach in FlyCarBody DllEntry\n")));
+		DisableThreadLibraryCalls((HMODULE)hinstDll);
+	}
+
+	if (dwReason == DLL_PROCESS_DETACH)
+	{
+		DEBUGMSG(1, (TEXT("Dettach in FlyCarBody DllEntry\n")));
+	}
+
+	DEBUGMSG(1, (TEXT("Leaving FlyCarBody DllEntry\n")));
+
+	return (TRUE);
+}

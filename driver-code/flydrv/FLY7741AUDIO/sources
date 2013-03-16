@@ -1,0 +1,30 @@
+TARGETNAME=FLY7741
+FILE_VIEW_ROOT_FOLDER= \
+    ReadMe.txt \
+    FLY7741.def \
+
+FILE_VIEW_RESOURCE_FOLDER= \
+
+FILE_VIEW_INCLUDES_FOLDER= \
+    FLY7741.h \
+    FLY7741_Data.h \
+
+SOURCES= \
+    FLY7741.cpp \
+    FLYDSP.cpp \
+
+INCLUDES= \
+    $(INCLUDES);$(_TARGETPLATROOT)\SRC\arm2\inc;\
+	$(_TARGETPLATROOT)\SRC\inc\flyinc;\
+
+RELEASETYPE=PLATFORM
+TARGETTYPE=DYNLINK
+CDEFINES=$(CDEFINES) -DFLY7419_EXPORTS
+TARGETLIBS= \
+    $(_PROJECTROOT)\cesysgen\sdk\lib\$(_CPUINDPATH)\coredll.lib \
+    $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyhwlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flyshmlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flysocketlib.lib \
+	$(_TARGETPLATROOT)\lib\ARMV4I\retail\flyuserlib.lib \
+	$(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\winsock.lib \
+	$(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\ws2.lib \

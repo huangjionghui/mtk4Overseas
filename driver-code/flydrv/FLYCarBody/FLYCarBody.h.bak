@@ -1,0 +1,98 @@
+/************************************************************************/
+/* FLYAUDIO CARBODY                                                     */
+/************************************************************************/
+#pragma once
+
+#ifndef _FLYAUDIO_CARBODY_H_
+#define _FLYAUDIO_CARBODY_H_
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+#define MCU_ADDR_R				0xA1
+#define MCU_ADDR_W				0xA0
+
+#define MCU_I2C_FREQ   100000      //50Khz
+
+#define DATA_BUFF_LENGTH_TO_MCU			1024
+#define DATA_BUFF_LENGTH_FROM_MCU		128	//Á¢¼´´¦Àí
+
+	typedef struct _FLY_CARBODY_INFO
+	{
+		BOOL bCarbodyEnable;
+
+		BOOL bKillDispatchFlyMainThread;
+		HANDLE FlyMainThreadHandle;
+		HANDLE hDispatchMainThreadEvent;
+
+		HANDLE hMsgQueueToGlobalCreate;
+		HANDLE hMsgQueueToKeyCreate;
+		HANDLE hMsgQueueToRadioCreate;
+
+		HANDLE hMsgQueueToSystemCreate;
+		HANDLE hMsgQueueFromSystemCreate;
+		BOOL bKillDispatchFlyMsgQueueSystemReadThread;
+		HANDLE FLyMsgQueueSystemReadThreadHandle;
+
+		HANDLE hMsgQueueToExtAmpCreate;
+		HANDLE hMsgQueueFromExtAmpCreate;
+		BOOL bKillDispatchFlyMsgQueueExtAmpReadThread;
+		HANDLE FLyMsgQueueExtAmpReadThreadHandle;
+
+		HANDLE hMsgQueueFromAssistDisplayCreate;
+		BOOL bKillDispatchFlyMsgQueueAssistDisplayReadThread;
+		HANDLE FLyMsgQueueAssistDisplayReadThreadHandle;
+
+		HANDLE hFlyCarbodyIIC;
+
+		BOOL bKillDispatchFlyCarbodyCommThread;
+		HANDLE hThreadHandleFlyCarbodyComm;
+		HANDLE hThreadHandleFlyCarbodyCommEvent;
+
+		BYTE buffToMCU[DATA_BUFF_LENGTH_TO_MCU];
+		UINT buffToMCUHx;
+		UINT buffToMCULx;
+		CRITICAL_SECTION hCSSendToMCU;
+		BYTE buffFromMCU[DATA_BUFF_LENGTH_FROM_MCU];
+		BYTE buffFromMCUProcessorStatus;
+		UINT buffFromMCUFrameLength;
+		UINT buffFromMCUFrameLengthMax;
+		BYTE buffFromMCUCRC;
+		BYTE buffFromMCUBak[DATA_BUFF_LENGTH_FROM_MCU];
+
+		HANDLE hInterruptEventIsrPin;
+		BOOL bInterruptIsrPinProcRunning;
+
+		PFLY_DRIVER_GLOBAL pFlyDriverGlobalInfo;
+		HANDLE hHandleGlobalGlobalEvent;
+
+		BOOL xxxxxxxxStarting;
+
+		BOOL bHaveRecPowerOffOrReset;
+	}FLY_CARBODY_INFO, *P_FLY_CARBODY_INFO;
+
+#if DEBUG_MSG_ON
+#define DBG0(CODE) if(1){CODE}
+
+	#define DBG1(CODE) if(1){CODE}
+	#define DBG2(CODE) if(1){CODE}
+	#define DBG3(CODE) if(1){CODE}
+
+//#define DBG1(CODE) if(pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.debugMsgLevel>0){CODE}
+//#define DBG2(CODE) if(pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.debugMsgLevel>1){CODE}
+//#define DBG3(CODE) if(pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.debugMsgLevel>2){CODE}
+#else
+#define DBG0(CODE) if(1){CODE}
+#define DBG1(CODE) if(pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.debugMsgLevel>0){CODE}
+#define DBG2(CODE) if(pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.debugMsgLevel>1){CODE}
+#define DBG3(CODE) if(pCarBodyInfo->pFlyDriverGlobalInfo->FlyGlobalCarbodyInfo.debugMsgLevel>2){CODE}
+#endif
+#ifdef __cplusplus
+}
+#endif
+
+
+
+#endif// _FLYAUDIO_CARBODY_H_

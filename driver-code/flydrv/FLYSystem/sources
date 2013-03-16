@@ -1,0 +1,43 @@
+TARGETNAME=FLYSystem
+FILE_VIEW_ROOT_FOLDER= \
+    ReadMe.txt \
+    FLYSystem.def \
+
+FILE_VIEW_RESOURCE_FOLDER= \
+
+FILE_VIEW_INCLUDES_FOLDER= \
+    FLYSystem.h \
+
+SOURCES= \
+    FLYSystem.cpp \
+    FlyResetPowerOff.cpp \
+
+RELEASETYPE=PLATFORM
+TARGETTYPE=DYNLINK
+CDEFINES=$(CDEFINES) -DFLYTEST_EXPORTS
+
+CDEFINES=$(CDEFINES) -DFLYTEST_RELEASE
+
+
+
+INCLUDES= \
+    $(INCLUDES);$(_TARGETPLATROOT)\SRC\arm2\inc;\
+	$(_TARGETPLATROOT)\SRC\inc\flyinc;\
+	$(ARM2_ROOT)\share_memory\
+	
+TARGETLIBS= \
+  $(_COMMONSDKROOT)\lib\$(_CPUINDPATH)\coredll.lib \
+  $(_COMMONOAKROOT)\lib\$(_CPUINDPATH)\ceddk.lib \
+  $(_PLATCOMMONLIB)\$(_CPUINDPATH)\os_adaption_layer.lib\
+  $(_PLATCOMMONLIB)\$(_CPUINDPATH)\gpio_mt3360_mtk_v1.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyhwlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyshmlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flysocketlib.lib \
+  $(_TARGETPLATROOT)\lib\ARMV4I\retail\flyuserlib.lib \
+  $(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\winsock.lib \
+  $(_COMMONSDKROOT)\LIB\$(_CPUINDPATH)\ws2.lib \
+
+SOURCELIBS= \
+  $(_PLATCOMMONLIB)\$(_CPUDEPPATH)\auxadc_mt3360_v1.lib \
+  $(_PLATCOMMONLIB)\$(_CPUINDPATH)\dual_mt3360_mtk_v1.lib  \
+  $(_PLATCOMMONLIB)\$(_CPUINDPATH)\oal_cache_mt3360_mtk_v1.lib  \
